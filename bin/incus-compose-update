@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
 # incus-compose-update — generic incus-compose image updater
 #
-# Reads per-service update metadata from compose.yaml (x-update: blocks)
-# and manages pins in a tracked versions.env file.
+# Reads per-service update metadata from the *rendered* compose definition
+# (incus-compose config output) and manages pins in a tracked versions.env.
+#
+# Why the rendered output, not the raw compose.yaml: incus-compose
+# auto-discovers and merges overlay files (e.g. a gitignored
+# compose.incus.yaml in Search_Providers), so the raw base file is not what
+# gets deployed. `incus-compose config` is the same binary that performs the
+# deploy, so its output cannot disagree with reality. x-update: blocks
+# survive the render intact; the only thing rendering destroys is the
+# ${VAR} pin variable name in image:, which is interpolated away — so that
+# one fact is still read from the raw file.
 #
 # Commands:
 #   check [service]        compare pins against upstream
@@ -12,7 +21,7 @@
 #   STACK_DIRS    colon-separated stack directories (required, or STACK_DIR)
 #   STACK_DIR     single-stack directory (alternative to STACK_DIRS)
 #   INCUS_POOL    storage pool (default: local)
-#   INCUS_PROJECT incus project (default: detected from compose.yaml)
+#   INCUS_PROJECT incus project (default: detected from rendered config)
 
 set -euo pipefail
 
@@ -30,7 +39,7 @@ config (environment):
   STACK_DIRS    colon-separated stack directories (required, or STACK_DIR)
   STACK_DIR     single-stack directory (alternative to STACK_DIRS)
   INCUS_POOL    storage pool (default: local)
-  INCUS_PROJECT incus project (default: detected from compose.yaml)
+  INCUS_PROJECT incus project (default: detected from rendered config)
 EOF
 }
 
@@ -56,9 +65,38 @@ resolve_stack_dirs() {
   fi
 }
 
+# --- rendered compose access ---
+#
+# RENDERED is a path to the output of `incus-compose config` for the current
+# stack dir. Both .env and versions.env are passed so variables resolve
+# exactly as they will at deploy time; versions.env is touched on demand
+# (incus-compose errors if a listed env file is missing).
+#
+# --env-file REPLACES the default .env: passing it once means .env is no
+# longer read unless also listed, so both must always be passed, pins last.
+
+incus_compose() {
+  local stack_dir="$1"; shift
+  ( cd "$stack_dir" && incus-compose --env-file .env --env-file versions.env "$@" )
+}
+
+render_stack() {
+  local stack_dir="$1"
+  local env_file="$stack_dir/versions.env"
+  [[ -f "$env_file" ]] || touch "$env_file"
+  RENDERED=$(mktemp)
+  # stderr carries "variable is not set" warnings — suppress, they confuse yq
+  incus_compose "$stack_dir" config 2>/dev/null > "$RENDERED" \
+    || die "incus-compose config failed in ${stack_dir}"
+}
+
+cleanup_render() {
+  [[ -n "${RENDERED:-}" ]] && rm -f "$RENDERED"
+}
+
 # --- image reference parsing ---
 
-# Parse image reference into HOST and REPO globals
+# Parse image reference into HOST and REPO globals (strips tag/digest).
 parse_image_ref() {
   local ref="$1"
   local bare="${ref%%:*}"
@@ -75,6 +113,8 @@ parse_image_ref() {
     # First segment contains . or : — it's a host
     HOST="${parts[0]}"
     REPO="${parts[*]:1}"
+    # docker.io uses library/ for single-segment official images
+    [[ "$HOST" == "docker.io" && "$REPO" != */* ]] && REPO="library/${REPO}"
   else
     # No host specified — defaults to docker.io
     HOST="docker.io"
@@ -83,32 +123,46 @@ parse_image_ref() {
 }
 
 # --- x-update: parsing ---
+#
+# Reads x-update metadata from the rendered config (RENDERED) and the pin
+# variable name from the raw compose.yaml (rendering interpolates ${VAR}
+# away). Sets globals: MODE, TAG_RE, ORDER, VOLUME, VERSION_CMD, IMAGE,
+# PIN_VAR, HOST, REPO.
 
-# Parse x-update block for a service. Sets globals:
-# MODE, TAG_RE, ORDER, VOLUME, VERSION_CMD, IMAGE, PIN_VAR, HOST, REPO
+pin_var_from_raw() {
+  local raw_compose="$1" service="$2"
+  yq -r ".services.\"${service}\".image" "$raw_compose" \
+    | grep -oP '\$\{[^}]+\}' | head -1 | sed 's/\${//;s/}//' || true
+}
+
 parse_x_update() {
-  local compose_file="$1" service="$2"
+  local stack_dir="$1" service="$2"
+  local rendered="$3"
+  local raw_compose="$stack_dir/compose.yaml"
 
-  # Check if service has x-update: block
-  yq -e ".services.\"${service}\".x-update" "$compose_file" >/dev/null 2>&1 \
+  # Check if service has x-update: block in the rendered definition
+  yq -e ".project.services.\"${service}\".x-update" "$rendered" >/dev/null 2>&1 \
     || die "service '${service}' has no x-update: block"
 
-  MODE=$(yq -r ".services.\"${service}\".x-update.mode // \"tag\"" "$compose_file")
-  TAG_RE=$(yq -r ".services.\"${service}\".x-update.tag_re // \"\"" "$compose_file")
-  ORDER=$(yq -r ".services.\"${service}\".x-update.order // \"version\"" "$compose_file")
-  VOLUME=$(yq -r ".services.\"${service}\".x-update.volume // \"none\"" "$compose_file")
+  MODE=$(yq -r ".project.services.\"${service}\".x-update.mode // \"tag\"" "$rendered")
+  TAG_RE=$(yq -r ".project.services.\"${service}\".x-update.tag_re // \"\"" "$rendered")
+  ORDER=$(yq -r ".project.services.\"${service}\".x-update.order // \"version\"" "$rendered")
+  VOLUME=$(yq -r ".project.services.\"${service}\".x-update.volume // \"none\"" "$rendered")
 
-  # version_cmd: array → space-separated string → bash array
+  # version_cmd: argv list → space-separated → bash array
   local version_cmd_raw
-  version_cmd_raw=$(yq -r "((.services.\"${service}\".x-update.version_cmd) // [\"${service}\", \"--version\"]) | .[]" "$compose_file" 2>/dev/null)
+  version_cmd_raw=$(
+    yq -r "((.project.services.\"${service}\".x-update.version_cmd) // [\"${service}\", \"--version\"]) | .[]" "$rendered" 2>/dev/null
+  )
   read -ra VERSION_CMD <<< "$(echo "$version_cmd_raw" | paste -sd ' ' -)"
 
-  # Image reference and pin variable
-  IMAGE=$(yq -r ".services.\"${service}\".image" "$compose_file")
-  PIN_VAR=$(echo "$IMAGE" | grep -oP '\$\{[^}]+\}' | head -1 | sed 's/\${//;s/}//')
-  [[ -n "$PIN_VAR" ]] || die "cannot detect pin variable in image '${IMAGE}'"
+  # Resolved image reference (tag/digest already interpolated by the render)
+  IMAGE=$(yq -r ".project.services.\"${service}\".image" "$rendered")
 
-  # Registry host and repo
+  # Pin variable name comes from the RAW file only
+  PIN_VAR=$(pin_var_from_raw "$raw_compose" "$service")
+  [[ -n "$PIN_VAR" ]] || die "cannot detect pin variable in raw compose image: $(yq -r ".services.\"${service}\".image" "$raw_compose")"
+
   parse_image_ref "$IMAGE"
 }
 
@@ -136,12 +190,12 @@ fetch_tags_oci() {
 
     curl -fsSL -D "$tmpheaders" -H "Authorization: Bearer $token" "$url" > "$tmpbody"
 
-    # Extract tags from body
     local page_tags
     page_tags=$(jq -r '.tags // [] | .[]' "$tmpbody")
     tags="${tags}${page_tags}"$'\n'
 
-    # Follow Link header
+    # Follow Link header to exhaustion — one unpaginated GHCR page yields a
+    # stale newest (firecrawl 2.10.19 vs the real 2.11.182 over 9 pages)
     link=$(grep -i '^link:' "$tmpheaders" | grep -oP '<[^>]+>' | tr -d '<>' | head -1)
     rm -f "$tmpbody" "$tmpheaders"
 
@@ -158,15 +212,23 @@ fetch_tags_oci() {
 
 fetch_digest() {
   local host="$1" repo="$2" tag="$3"
-  local token
-  token=$(curl -fsSL "https://${host}/token?scope=repository:${repo}:pull" | jq -r .token)
+  local token reg_host
+  if [[ "$host" == "docker.io" ]]; then
+    # Docker Hub: separate auth service, registry on registry-1. The /token
+    # endpoint (used by ghcr.io and friends) does not exist on docker.io.
+    token=$(curl -fsSL "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${repo}:pull" | jq -r .token)
+    reg_host="registry-1.docker.io"
+  else
+    token=$(curl -fsSL "https://${host}/token?scope=repository:${repo}:pull" | jq -r .token)
+    reg_host="$host"
+  fi
   curl -fsSL -o /dev/null -D - -I \
     -H "Authorization: Bearer $token" \
     -H "Accept: application/vnd.oci.image.index.v1+json" \
     -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
     -H "Accept: application/vnd.oci.image.manifest.v1+json" \
     -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
-    "https://${host}/v2/${repo}/manifests/${tag}" \
+    "https://${reg_host}/v2/${repo}/manifests/${tag}" \
     | grep -i '^docker-content-digest:' \
     | awk '{print $2}' \
     | tr -d '\r'
@@ -211,9 +273,8 @@ write_pin() {
 # --- incus operations ---
 
 detect_project() {
-  local n=""
-  [[ -f "$1" ]] && n=$(grep -E '^name:' "$1" | head -1 | sed 's/^name:[[:space:]]*//; s/[[:space:]]*$//')
-  echo "${n:-unknown}"
+  # From the rendered config, not the raw file: overlays can set name:
+  yq -r '.project.name // empty' "$1" 2>/dev/null | head -1
 }
 
 preflight() {
@@ -229,6 +290,7 @@ preflight() {
 version_of() {
   local stack_dir="$1" service="$2"
   shift 2
+  # exec doesn't parse the compose file — no env-file flags needed
   ( cd "$stack_dir" && incus-compose exec "$service" -- "$@" 2>/dev/null ) || true
 }
 
@@ -236,10 +298,9 @@ version_of() {
 
 cmd_check_one() {
   local stack_dir="$1" service="$2"
-  local compose_file="$stack_dir/compose.yaml"
   local env_file="$stack_dir/versions.env"
 
-  parse_x_update "$compose_file" "$service"
+  parse_x_update "$stack_dir" "$service" "$RENDERED"
 
   local cur
   cur=$(current_pin "$env_file" "$PIN_VAR")
@@ -275,9 +336,10 @@ cmd_check_one() {
       die "update tag_re for ${service} in compose.yaml"
     }
 
-    # Backwards guard: error if newest is older than current
+    # Never move backwards: a computed-newest that sorts older than the pin
+    # is truncation (pagination bug) or a scheme change — make it loud.
     if [[ "$cur" != "$new" ]] && ! version_gte "$new" "$cur"; then
-      die "upstream newest (${new}) is older than current pin (${cur}) — possible truncation or scheme change"
+      die "upstream newest (${new}) is older than current pin (${cur}) — upstream list looks truncated or the tag scheme changed"
     fi
 
     printf 'current: %s\nlatest:  %s\n' "$cur" "$new"
@@ -296,22 +358,31 @@ cmd_check() {
   if [[ -n "$service" ]]; then
     local found=0
     while IFS= read -r dir; do
-      if [[ -f "$dir/compose.yaml" ]] && yq -e ".services.\"${service}\"" "$dir/compose.yaml" >/dev/null 2>&1; then
+      [[ -f "$dir/compose.yaml" ]] || continue
+      render_stack "$dir"
+      if yq -e ".project.services.\"${service}\"" "$RENDERED" >/dev/null 2>&1; then
         cmd_check_one "$dir" "$service"
         found=1
+        cleanup_render
         break
       fi
+      cleanup_render
     done < <(resolve_stack_dirs)
     [[ $found -eq 1 ]] || die "service '${service}' not found in any stack dir"
   else
+    # Each stack is checked independently — one unreachable registry must
+    # not abort the others (that's what the per-stack `if` below is for).
     while IFS= read -r dir; do
       [[ -f "$dir/compose.yaml" ]] || continue
+      echo "== stack: ${dir}"
+      render_stack "$dir"
       local services
-      services=$(yq -r '.services | keys[]' "$dir/compose.yaml")
+      services=$(yq -r '.project.services | keys[]' "$RENDERED")
       for svc in $services; do
-        yq -e ".services.\"${svc}\".x-update" "$dir/compose.yaml" >/dev/null 2>&1 || continue
+        yq -e ".project.services.\"${svc}\".x-update" "$RENDERED" >/dev/null 2>&1 || continue
         cmd_check_one "$dir" "$svc"
       done
+      cleanup_render
     done < <(resolve_stack_dirs)
   fi
 }
@@ -323,18 +394,20 @@ cmd_apply() {
   # Find stack dir containing this service
   local stack_dir=""
   while IFS= read -r dir; do
-    if [[ -f "$dir/compose.yaml" ]] && yq -e ".services.\"${service}\"" "$dir/compose.yaml" >/dev/null 2>&1; then
+    [[ -f "$dir/compose.yaml" ]] || continue
+    render_stack "$dir"
+    if yq -e ".project.services.\"${service}\"" "$RENDERED" >/dev/null 2>&1; then
       stack_dir="$dir"
       break
     fi
+    cleanup_render
   done < <(resolve_stack_dirs)
   [[ -n "$stack_dir" ]] || die "service '${service}' not found in any stack dir"
 
-  local compose_file="$stack_dir/compose.yaml"
   local env_file="$stack_dir/versions.env"
   [[ -f "$env_file" ]] || touch "$env_file"
 
-  parse_x_update "$compose_file" "$service"
+  parse_x_update "$stack_dir" "$service" "$RENDERED"
 
   local cur
   cur=$(current_pin "$env_file" "$PIN_VAR")
@@ -342,7 +415,7 @@ cmd_apply() {
   [[ "$cur" == "$ref" ]] && { echo "already on $ref"; return 0; }
 
   local project
-  project=$(detect_project "$compose_file")
+  project=$(detect_project "$RENDERED")
   project="${INCUS_PROJECT:-$project}"
 
   preflight "$project" "$VOLUME"
@@ -362,9 +435,9 @@ cmd_apply() {
   echo "==> pinning ${cur} -> ${ref}"
   write_pin "$env_file" "$PIN_VAR" "$ref"
 
-  # Recreate — pass both env files so incus-compose resolves all variables
+  # Recreate — both env files, pins last
   echo "==> pulling and recreating"
-  ( cd "$stack_dir" && incus-compose --env-file .env --env-file versions.env up -d --recreate --pull always "$service" )
+  incus_compose "$stack_dir" up -d --recreate --pull always "$service"
 
   # Wait for readiness
   echo "==> waiting for readiness"
@@ -377,7 +450,7 @@ cmd_apply() {
   done
   echo
 
-  ( cd "$stack_dir" && incus-compose --env-file .env --env-file versions.env ps )
+  incus_compose "$stack_dir" ps
 
   if [[ -z "$after" || "$after" == "$before" ]]; then
     echo
@@ -393,7 +466,9 @@ cmd_apply() {
   echo "    ${before:-<none>}"
   echo " -> ${after}"
 
-  # Commit but never push
+  # Commit but never push. Auto-pushing adds auth prompts, rejected pushes
+  # and branch-protection failures to a run that just succeeded. Unpushed
+  # pins drift between machines though — say so rather than stay silent.
   if git -C "$stack_dir" commit -q -m "${service}: ${cur} -> ${ref}" -- "$env_file" 2>/dev/null; then
     echo "==> pinned and committed (not pushed)"
     if git -C "$stack_dir" remote | grep -q .; then
