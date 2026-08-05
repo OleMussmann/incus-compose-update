@@ -1,0 +1,415 @@
+#!/usr/bin/env bash
+# incus-compose-update — generic incus-compose image updater
+#
+# Reads per-service update metadata from compose.yaml (x-update: blocks)
+# and manages pins in a tracked versions.env file.
+#
+# Commands:
+#   check [service]        compare pins against upstream
+#   apply <service> <ref>  snapshot, pin, recreate, verify
+#
+# Environment:
+#   STACK_DIRS    colon-separated stack directories (required, or STACK_DIR)
+#   STACK_DIR     single-stack directory (alternative to STACK_DIRS)
+#   INCUS_POOL    storage pool (default: local)
+#   INCUS_PROJECT incus project (default: detected from compose.yaml)
+
+set -euo pipefail
+
+die() { echo "error: $*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+usage:
+  incus-compose-update check                  compare pinned tags against upstream, all services
+  incus-compose-update check <service>        same, scoped to one service
+  incus-compose-update apply <service> <ref>  snapshot, pin, recreate, verify
+  incus-compose-update --help                 this text
+
+config (environment):
+  STACK_DIRS    colon-separated stack directories (required, or STACK_DIR)
+  STACK_DIR     single-stack directory (alternative to STACK_DIRS)
+  INCUS_POOL    storage pool (default: local)
+  INCUS_PROJECT incus project (default: detected from compose.yaml)
+EOF
+}
+
+# --help/-h must work without STACK_DIRS set
+case "${1:-}" in
+  --help|-h) usage; exit 0 ;;
+esac
+
+POOL="${INCUS_POOL:-local}"
+READY_TRIES="${READY_TRIES:-20}"
+READY_INTERVAL="${READY_INTERVAL:-3}"
+
+# --- stack directory resolution ---
+
+resolve_stack_dirs() {
+  if [[ -n "${STACK_DIRS:-}" ]]; then
+    IFS=':' read -ra dirs <<< "$STACK_DIRS"
+    printf '%s\n' "${dirs[@]}"
+  elif [[ -n "${STACK_DIR:-}" ]]; then
+    echo "$STACK_DIR"
+  else
+    die "set STACK_DIRS (colon-separated) or STACK_DIR"
+  fi
+}
+
+# --- image reference parsing ---
+
+# Parse image reference into HOST and REPO globals
+parse_image_ref() {
+  local ref="$1"
+  local bare="${ref%%:*}"
+  bare="${bare%%@*}"
+
+  local IFS='/'
+  read -ra parts <<< "$bare"
+
+  if [[ ${#parts[@]} -eq 1 ]]; then
+    # Single segment: docker.io/library/<repo>
+    HOST="docker.io"
+    REPO="library/${parts[0]}"
+  elif [[ "${parts[0]}" == *.* || "${parts[0]}" == *:* ]]; then
+    # First segment contains . or : — it's a host
+    HOST="${parts[0]}"
+    REPO="${parts[*]:1}"
+  else
+    # No host specified — defaults to docker.io
+    HOST="docker.io"
+    REPO="$bare"
+  fi
+}
+
+# --- x-update: parsing ---
+
+# Parse x-update block for a service. Sets globals:
+# MODE, TAG_RE, ORDER, VOLUME, VERSION_CMD, IMAGE, PIN_VAR, HOST, REPO
+parse_x_update() {
+  local compose_file="$1" service="$2"
+
+  # Check if service has x-update: block
+  yq -e ".services.\"${service}\".x-update" "$compose_file" >/dev/null 2>&1 \
+    || die "service '${service}' has no x-update: block"
+
+  MODE=$(yq -r ".services.\"${service}\".x-update.mode // \"tag\"" "$compose_file")
+  TAG_RE=$(yq -r ".services.\"${service}\".x-update.tag_re // \"\"" "$compose_file")
+  ORDER=$(yq -r ".services.\"${service}\".x-update.order // \"version\"" "$compose_file")
+  VOLUME=$(yq -r ".services.\"${service}\".x-update.volume // \"none\"" "$compose_file")
+
+  # version_cmd: array → space-separated string → bash array
+  local version_cmd_raw
+  version_cmd_raw=$(yq -r "((.services.\"${service}\".x-update.version_cmd) // [\"${service}\", \"--version\"]) | .[]" "$compose_file" 2>/dev/null)
+  read -ra VERSION_CMD <<< "$(echo "$version_cmd_raw" | paste -sd ' ' -)"
+
+  # Image reference and pin variable
+  IMAGE=$(yq -r ".services.\"${service}\".image" "$compose_file")
+  PIN_VAR=$(echo "$IMAGE" | grep -oP '\$\{[^}]+\}' | head -1 | sed 's/\${//;s/}//')
+  [[ -n "$PIN_VAR" ]] || die "cannot detect pin variable in image '${IMAGE}'"
+
+  # Registry host and repo
+  parse_image_ref "$IMAGE"
+}
+
+# --- registry access ---
+
+fetch_tags_dockerhub() {
+  local repo="$1"
+  curl -fsSL "https://hub.docker.com/v2/repositories/${repo}/tags?page_size=100&ordering=last_updated" \
+    | jq -r '.results[].name'
+}
+
+fetch_tags_oci() {
+  local host="$1" repo="$2"
+  local token url tags link tmpbody tmpheaders
+
+  token=$(curl -fsSL "https://${host}/token?scope=repository:${repo}:pull" | jq -r .token)
+  [[ -n "$token" && "$token" != "null" ]] || die "could not get token for ${host}/${repo}"
+
+  url="https://${host}/v2/${repo}/tags/list?n=100"
+  tags=""
+
+  while [[ -n "$url" ]]; do
+    tmpbody=$(mktemp)
+    tmpheaders=$(mktemp)
+
+    curl -fsSL -D "$tmpheaders" -H "Authorization: Bearer $token" "$url" > "$tmpbody"
+
+    # Extract tags from body
+    local page_tags
+    page_tags=$(jq -r '.tags // [] | .[]' "$tmpbody")
+    tags="${tags}${page_tags}"$'\n'
+
+    # Follow Link header
+    link=$(grep -i '^link:' "$tmpheaders" | grep -oP '<[^>]+>' | tr -d '<>' | head -1)
+    rm -f "$tmpbody" "$tmpheaders"
+
+    if [[ -n "$link" ]]; then
+      [[ "$link" == /* ]] && link="https://${host}${link}"
+      url="$link"
+    else
+      url=""
+    fi
+  done
+
+  echo "$tags" | grep -v '^$' | sort -u
+}
+
+fetch_digest() {
+  local host="$1" repo="$2" tag="$3"
+  local token
+  token=$(curl -fsSL "https://${host}/token?scope=repository:${repo}:pull" | jq -r .token)
+  curl -fsSL -o /dev/null -D - -I \
+    -H "Authorization: Bearer $token" \
+    -H "Accept: application/vnd.oci.image.index.v1+json" \
+    -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+    -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+    -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+    "https://${host}/v2/${repo}/manifests/${tag}" \
+    | grep -i '^docker-content-digest:' \
+    | awk '{print $2}' \
+    | tr -d '\r'
+}
+
+# --- tag selection ---
+
+newest_tag() {
+  local tags="$1" tag_re="$2" order="$3"
+  local filtered
+  filtered=$(echo "$tags" | { grep -E "$tag_re" || true; })
+  [[ -n "$filtered" ]] || return 1
+
+  if [[ "$order" == "pushed" ]]; then
+    echo "$filtered" | head -1
+  else
+    echo "$filtered" | sort -V | tail -1
+  fi
+}
+
+# --- backwards guard ---
+
+version_gte() {
+  printf '%s\n%s' "$2" "$1" | sort -V -C
+}
+
+# --- pin file operations ---
+
+current_pin() {
+  grep -E "^${2}=" "$1" 2>/dev/null | head -1 | cut -d= -f2- || true
+}
+
+write_pin() {
+  local env_file="$1" pin_var="$2" value="$3"
+  if grep -qE "^${pin_var}=" "$env_file" 2>/dev/null; then
+    sed -i "s|^${pin_var}=.*|${pin_var}=${value}|" "$env_file"
+  else
+    echo "${pin_var}=${value}" >> "$env_file"
+  fi
+}
+
+# --- incus operations ---
+
+detect_project() {
+  local n=""
+  [[ -f "$1" ]] && n=$(grep -E '^name:' "$1" | head -1 | sed 's/^name:[[:space:]]*//; s/[[:space:]]*$//')
+  echo "${n:-unknown}"
+}
+
+preflight() {
+  local project="$1" volume="$2"
+  [[ "$volume" == "none" ]] && return 0
+  if ! incus --project "$project" storage volume show "$POOL" "$volume" >/dev/null 2>&1; then
+    echo "cannot find volume '${volume}' on pool '${POOL}' in project '${project}'" >&2
+    incus --project "$project" storage volume list "$POOL" >&2 || true
+    die "set INCUS_POOL or x-update.volume to match"
+  fi
+}
+
+version_of() {
+  local stack_dir="$1" service="$2"
+  shift 2
+  ( cd "$stack_dir" && incus-compose exec "$service" -- "$@" 2>/dev/null ) || true
+}
+
+# --- commands ---
+
+cmd_check_one() {
+  local stack_dir="$1" service="$2"
+  local compose_file="$stack_dir/compose.yaml"
+  local env_file="$stack_dir/versions.env"
+
+  parse_x_update "$compose_file" "$service"
+
+  local cur
+  cur=$(current_pin "$env_file" "$PIN_VAR")
+  if [[ -z "$cur" ]]; then
+    echo "== ${service}: no ${PIN_VAR} in ${env_file} — skipping"
+    return 0
+  fi
+
+  echo "== ${service}"
+
+  if [[ "$MODE" == "digest" ]]; then
+    local remote_digest
+    remote_digest=$(fetch_digest "$HOST" "$REPO" "latest") \
+      || die "could not fetch digest for ${REPO}:latest"
+    printf 'current: %s\nlatest:  %s\n' "$cur" "$remote_digest"
+    if [[ "$cur" == "$remote_digest" ]]; then
+      echo "up to date"
+    else
+      printf 'apply:     incus-compose-update apply %s %s\n' "$service" "$remote_digest"
+    fi
+  else
+    local tags new
+    if [[ "$HOST" == "docker.io" ]]; then
+      tags=$(fetch_tags_dockerhub "$REPO") || die "could not reach Docker Hub for ${REPO}"
+    else
+      tags=$(fetch_tags_oci "$HOST" "$REPO") || die "could not reach ${HOST} for ${REPO}"
+    fi
+
+    new=$(newest_tag "$tags" "$TAG_RE" "$ORDER") || {
+      echo "no tags matched ${TAG_RE}" >&2
+      echo "upstream may have changed its versioning scheme. Saw:" >&2
+      printf '%s\n' "$tags" | head -8 | sed 's/^/  /' >&2
+      die "update tag_re for ${service} in compose.yaml"
+    }
+
+    # Backwards guard: error if newest is older than current
+    if [[ "$cur" != "$new" ]] && ! version_gte "$new" "$cur"; then
+      die "upstream newest (${new}) is older than current pin (${cur}) — possible truncation or scheme change"
+    fi
+
+    printf 'current: %s\nlatest:  %s\n' "$cur" "$new"
+    if [[ "$cur" == "$new" ]]; then
+      echo "up to date"
+    else
+      printf 'apply:     incus-compose-update apply %s %s\n' "$service" "$new"
+    fi
+  fi
+  echo
+}
+
+cmd_check() {
+  local service="${1:-}"
+
+  if [[ -n "$service" ]]; then
+    local found=0
+    while IFS= read -r dir; do
+      if [[ -f "$dir/compose.yaml" ]] && yq -e ".services.\"${service}\"" "$dir/compose.yaml" >/dev/null 2>&1; then
+        cmd_check_one "$dir" "$service"
+        found=1
+        break
+      fi
+    done < <(resolve_stack_dirs)
+    [[ $found -eq 1 ]] || die "service '${service}' not found in any stack dir"
+  else
+    while IFS= read -r dir; do
+      [[ -f "$dir/compose.yaml" ]] || continue
+      local services
+      services=$(yq -r '.services | keys[]' "$dir/compose.yaml")
+      for svc in $services; do
+        yq -e ".services.\"${svc}\".x-update" "$dir/compose.yaml" >/dev/null 2>&1 || continue
+        cmd_check_one "$dir" "$svc"
+      done
+    done < <(resolve_stack_dirs)
+  fi
+}
+
+cmd_apply() {
+  local service="${1:-}" ref="${2:-}"
+  [[ -n "$service" && -n "$ref" ]] || die "usage: incus-compose-update apply <service> <ref>"
+
+  # Find stack dir containing this service
+  local stack_dir=""
+  while IFS= read -r dir; do
+    if [[ -f "$dir/compose.yaml" ]] && yq -e ".services.\"${service}\"" "$dir/compose.yaml" >/dev/null 2>&1; then
+      stack_dir="$dir"
+      break
+    fi
+  done < <(resolve_stack_dirs)
+  [[ -n "$stack_dir" ]] || die "service '${service}' not found in any stack dir"
+
+  local compose_file="$stack_dir/compose.yaml"
+  local env_file="$stack_dir/versions.env"
+  [[ -f "$env_file" ]] || touch "$env_file"
+
+  parse_x_update "$compose_file" "$service"
+
+  local cur
+  cur=$(current_pin "$env_file" "$PIN_VAR")
+  [[ -n "$cur" ]] || die "no ${PIN_VAR} in ${env_file}"
+  [[ "$cur" == "$ref" ]] && { echo "already on $ref"; return 0; }
+
+  local project
+  project=$(detect_project "$compose_file")
+  project="${INCUS_PROJECT:-$project}"
+
+  preflight "$project" "$VOLUME"
+
+  local before
+  before=$(version_of "$stack_dir" "$service" "${VERSION_CMD[@]}")
+
+  # Snapshot
+  local snap=""
+  if [[ "$VOLUME" != "none" ]]; then
+    snap="pre-${ref}-$(date +%Y%m%d%H%M)"
+    echo "==> snapshotting ${project}:${POOL}/${VOLUME} as ${snap}"
+    incus --project "$project" storage volume snapshot create "$POOL" "$VOLUME" "$snap"
+  fi
+
+  # Pin
+  echo "==> pinning ${cur} -> ${ref}"
+  write_pin "$env_file" "$PIN_VAR" "$ref"
+
+  # Recreate — pass both env files so incus-compose resolves all variables
+  echo "==> pulling and recreating"
+  ( cd "$stack_dir" && incus-compose --env-file .env --env-file versions.env up -d --recreate --pull always "$service" )
+
+  # Wait for readiness
+  echo "==> waiting for readiness"
+  local after=""
+  for _ in $(seq 1 "$READY_TRIES"); do
+    sleep "$READY_INTERVAL"
+    after=$(version_of "$stack_dir" "$service" "${VERSION_CMD[@]}")
+    [[ -n "$after" && "$after" != "$before" ]] && break
+    printf '.'
+  done
+  echo
+
+  ( cd "$stack_dir" && incus-compose --env-file .env --env-file versions.env ps )
+
+  if [[ -z "$after" || "$after" == "$before" ]]; then
+    echo
+    echo "!! verification failed after $((READY_TRIES * READY_INTERVAL))s"
+    echo "   before: ${before:-<none>}"
+    echo "   after:  ${after:-<no output>}"
+    echo "   identical output usually means the instance was not recreated."
+    echo "   logs:       incus --project ${project} console ${service}-1 --show-log"
+    echo "   roll back:  incus-compose-update apply ${service} ${cur}"
+    [[ -n "$snap" ]] && echo "   or restore: incus --project ${project} storage volume restore ${POOL} ${VOLUME} ${snap}"
+    exit 1
+  fi
+  echo "    ${before:-<none>}"
+  echo " -> ${after}"
+
+  # Commit but never push
+  if git -C "$stack_dir" commit -q -m "${service}: ${cur} -> ${ref}" -- "$env_file" 2>/dev/null; then
+    echo "==> pinned and committed (not pushed)"
+    if git -C "$stack_dir" remote | grep -q .; then
+      echo "    push when ready: git -C ${stack_dir} push"
+    fi
+  else
+    echo "==> pinned (not committed — no repo, or nothing to commit)"
+  fi
+
+  echo "==> done. rollback: incus-compose-update apply ${service} ${cur}"
+}
+
+# --- main ---
+
+case "${1:-check}" in
+  check)  shift; cmd_check "${1:-}" ;;
+  apply)  shift; cmd_apply "${1:-}" "${2:-}" ;;
+  *)      die "usage: incus-compose-update {check [service] | apply <service> <ref>}" ;;
+esac
