@@ -274,7 +274,7 @@ write_pin() {
 
 detect_project() {
   # From the rendered config, not the raw file: overlays can set name:
-  yq -r '.project.name // empty' "$1" 2>/dev/null | head -1
+  yq -r '.project.name // ""' "$1" 2>/dev/null | head -1
 }
 
 preflight() {
@@ -290,8 +290,10 @@ preflight() {
 version_of() {
   local stack_dir="$1" service="$2"
   shift 2
-  # exec doesn't parse the compose file — no env-file flags needed
-  ( cd "$stack_dir" && incus-compose exec "$service" -- "$@" 2>/dev/null ) || true
+  # exec DOES parse compose.yaml (to find the instance), so both env files
+  # must be supplied or interpolated ${VAR}s render blank and the command
+  # fails before ever reaching the container.
+  ( cd "$stack_dir" && incus-compose --env-file .env --env-file versions.env exec "$service" -- "$@" 2>/dev/null ) || true
 }
 
 # --- commands ---
