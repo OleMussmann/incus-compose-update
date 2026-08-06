@@ -114,7 +114,9 @@ parse_image_ref() {
     HOST="${parts[0]}"
     REPO="${parts[*]:1}"
     # docker.io uses library/ for single-segment official images
-    [[ "$HOST" == "docker.io" && "$REPO" != */* ]] && REPO="library/${REPO}"
+    if [[ "$HOST" == "docker.io" && "$REPO" != */* ]]; then
+      REPO="library/${REPO}"
+    fi
   else
     # No host specified — defaults to docker.io
     HOST="docker.io"
@@ -131,7 +133,9 @@ parse_image_ref() {
 
 pin_var_from_raw() {
   local raw_compose="$1" service="$2"
-  yq -r ".services.\"${service}\".image" "$raw_compose" \
+  # Raw compose.yaml may use merge anchors (<<: *common-service). yq-go warns
+  # about that by default; --yaml-fix-merge-anchor-to-spec silences it.
+  yq --yaml-fix-merge-anchor-to-spec -r ".services.\"${service}\".image" "$raw_compose" \
     | grep -oP '\$\{[^}]+\}' | head -1 | sed 's/\${//;s/}//' || true
 }
 
