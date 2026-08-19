@@ -142,3 +142,8 @@ Or set `INCUS_COMPOSE_ENV_FILE='.env,versions.env'` in your shell.
   aborts the whole run if any of them cannot be resolved
 - **Confirm before recreate**: `apply-all` prompts once, and refuses to run
   non-interactively unless given `--yes`
+- **Start after recreate**: a service-scoped `up` under incus-compose 1.2.0 can
+  build the instance correctly and still leave it stopped, because its
+  "Starting resources" phase bails on any resource the run did not ensure —
+  including sibling services' images. `apply` follows every recreate with a
+  `start`, which is a no-op when the service is already running

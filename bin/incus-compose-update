@@ -465,6 +465,21 @@ cmd_apply() {
   echo "==> pulling and recreating"
   incus_compose "$stack_dir" up -d --recreate --pull always "$service"
 
+  # A service-scoped `up` under incus-compose 1.2.0 can create the instance
+  # correctly and then leave it STOPPED: its "Starting resources" phase walks
+  # the whole project graph and bails on any resource this run did not ensure,
+  # including sibling services' images. Hit live 2026-08-19 updating hermes in
+  # a two-service stack — "resource not ensured:
+  # image(docker.io/syncthing/syncthing:2.1.3)", buried mid-stream, instance
+  # built with the right image and volumes but never booted.
+  #
+  # `start` walks a much smaller graph and gets it up. On an already-running
+  # service it declines with "resource is already running" and leaves the
+  # process untouched, so this is a no-op on the happy path — hence the
+  # swallowed output. A start that genuinely fails still surfaces, as the
+  # readiness check below will not see a new version.
+  incus_compose "$stack_dir" start "$service" >/dev/null 2>&1 || true
+
   # Wait for readiness
   echo "==> waiting for readiness"
   local after=""
