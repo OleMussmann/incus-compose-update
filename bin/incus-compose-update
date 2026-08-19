@@ -88,6 +88,14 @@ render_stack() {
   # stderr carries "variable is not set" warnings — suppress, they confuse yq
   incus_compose "$stack_dir" config 2>/dev/null > "$RENDERED" \
     || die "incus-compose config failed in ${stack_dir}"
+  # incus-compose 1.1.0 wrapped the render in a top-level `project:` key;
+  # 1.2.0 emits name:/services: at the root instead. Unwrap the old shape so
+  # every query below can assume the flat one. Hit live 2026-08-19: after the
+  # 1.2.0 upgrade every .project.* path resolved to null and check died with
+  # "cannot get keys of !!null".
+  if yq -e '.project' "$RENDERED" >/dev/null 2>&1; then
+    yq -i '.project' "$RENDERED"
+  fi
 }
 
 cleanup_render() {
@@ -145,23 +153,23 @@ parse_x_update() {
   local raw_compose="$stack_dir/compose.yaml"
 
   # Check if service has x-update: block in the rendered definition
-  yq -e ".project.services.\"${service}\".x-update" "$rendered" >/dev/null 2>&1 \
+  yq -e ".services.\"${service}\".x-update" "$rendered" >/dev/null 2>&1 \
     || die "service '${service}' has no x-update: block"
 
-  MODE=$(yq -r ".project.services.\"${service}\".x-update.mode // \"tag\"" "$rendered")
-  TAG_RE=$(yq -r ".project.services.\"${service}\".x-update.tag_re // \"\"" "$rendered")
-  ORDER=$(yq -r ".project.services.\"${service}\".x-update.order // \"version\"" "$rendered")
-  VOLUME=$(yq -r ".project.services.\"${service}\".x-update.volume // \"none\"" "$rendered")
+  MODE=$(yq -r ".services.\"${service}\".x-update.mode // \"tag\"" "$rendered")
+  TAG_RE=$(yq -r ".services.\"${service}\".x-update.tag_re // \"\"" "$rendered")
+  ORDER=$(yq -r ".services.\"${service}\".x-update.order // \"version\"" "$rendered")
+  VOLUME=$(yq -r ".services.\"${service}\".x-update.volume // \"none\"" "$rendered")
 
   # version_cmd: argv list → space-separated → bash array
   local version_cmd_raw
   version_cmd_raw=$(
-    yq -r "((.project.services.\"${service}\".x-update.version_cmd) // [\"${service}\", \"--version\"]) | .[]" "$rendered" 2>/dev/null
+    yq -r "((.services.\"${service}\".x-update.version_cmd) // [\"${service}\", \"--version\"]) | .[]" "$rendered" 2>/dev/null
   )
   read -ra VERSION_CMD <<< "$(echo "$version_cmd_raw" | paste -sd ' ' -)"
 
   # Resolved image reference (tag/digest already interpolated by the render)
-  IMAGE=$(yq -r ".project.services.\"${service}\".image" "$rendered")
+  IMAGE=$(yq -r ".services.\"${service}\".image" "$rendered")
 
   # Pin variable name comes from the RAW file only
   PIN_VAR=$(pin_var_from_raw "$raw_compose" "$service")
@@ -278,7 +286,7 @@ write_pin() {
 
 detect_project() {
   # From the rendered config, not the raw file: overlays can set name:
-  yq -r '.project.name // ""' "$1" 2>/dev/null | head -1
+  yq -r '.name // ""' "$1" 2>/dev/null | head -1
 }
 
 preflight() {
@@ -366,7 +374,7 @@ cmd_check() {
     while IFS= read -r dir; do
       [[ -f "$dir/compose.yaml" ]] || continue
       render_stack "$dir"
-      if yq -e ".project.services.\"${service}\"" "$RENDERED" >/dev/null 2>&1; then
+      if yq -e ".services.\"${service}\"" "$RENDERED" >/dev/null 2>&1; then
         cmd_check_one "$dir" "$service"
         found=1
         cleanup_render
@@ -383,9 +391,9 @@ cmd_check() {
       echo "== stack: ${dir}"
       render_stack "$dir"
       local services
-      services=$(yq -r '.project.services | keys[]' "$RENDERED")
+      services=$(yq -r '.services | keys[]' "$RENDERED")
       for svc in $services; do
-        yq -e ".project.services.\"${svc}\".x-update" "$RENDERED" >/dev/null 2>&1 || continue
+        yq -e ".services.\"${svc}\".x-update" "$RENDERED" >/dev/null 2>&1 || continue
         cmd_check_one "$dir" "$svc"
       done
       cleanup_render
@@ -402,7 +410,7 @@ cmd_apply() {
   while IFS= read -r dir; do
     [[ -f "$dir/compose.yaml" ]] || continue
     render_stack "$dir"
-    if yq -e ".project.services.\"${service}\"" "$RENDERED" >/dev/null 2>&1; then
+    if yq -e ".services.\"${service}\"" "$RENDERED" >/dev/null 2>&1; then
       stack_dir="$dir"
       break
     fi
