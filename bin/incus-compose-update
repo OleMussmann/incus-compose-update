@@ -16,6 +16,7 @@
 # Commands:
 #   check [service]        compare pins against upstream
 #   apply <service> <ref>  snapshot, pin, recreate, verify
+#   apply-all [--yes]      apply every pending update, sequentially
 #
 # Environment:
 #   STACK_DIRS    colon-separated stack directories (required, or STACK_DIR)
@@ -33,6 +34,7 @@ usage:
   incus-compose-update check                  compare pinned tags against upstream, all services
   incus-compose-update check <service>        same, scoped to one service
   incus-compose-update apply <service> <ref>  snapshot, pin, recreate, verify
+  incus-compose-update apply-all [--yes]      apply every pending update, one at a time
   incus-compose-update --help                 this text
 
 config (environment):
@@ -308,6 +310,45 @@ version_of() {
   ( cd "$stack_dir" && incus-compose --env-file .env --env-file versions.env exec "$service" -- "$@" 2>/dev/null ) || true
 }
 
+# --- upstream resolution ---
+
+# Newest upstream ref for the service described by the globals parse_x_update
+# just set (MODE, TAG_RE, ORDER, HOST, REPO). Echoes the ref; dies on an
+# unreachable registry, a tag_re that no longer matches, or a result that
+# sorts older than the current pin. Shared by check and apply-all so the two
+# can never disagree about what "latest" means.
+resolve_latest() {
+  local service="$1" cur="$2"
+
+  if [[ "$MODE" == "digest" ]]; then
+    fetch_digest "$HOST" "$REPO" "latest" \
+      || die "could not fetch digest for ${REPO}:latest"
+    return 0
+  fi
+
+  local tags new
+  if [[ "$HOST" == "docker.io" ]]; then
+    tags=$(fetch_tags_dockerhub "$REPO") || die "could not reach Docker Hub for ${REPO}"
+  else
+    tags=$(fetch_tags_oci "$HOST" "$REPO") || die "could not reach ${HOST} for ${REPO}"
+  fi
+
+  new=$(newest_tag "$tags" "$TAG_RE" "$ORDER") || {
+    echo "no tags matched ${TAG_RE}" >&2
+    echo "upstream may have changed its versioning scheme. Saw:" >&2
+    printf '%s\n' "$tags" | head -8 | sed 's/^/  /' >&2
+    die "update tag_re for ${service} in compose.yaml"
+  }
+
+  # Never move backwards: a computed-newest that sorts older than the pin
+  # is truncation (pagination bug) or a scheme change — make it loud.
+  if [[ "$cur" != "$new" ]] && ! version_gte "$new" "$cur"; then
+    die "upstream newest (${new}) is older than current pin (${cur}) — upstream list looks truncated or the tag scheme changed"
+  fi
+
+  echo "$new"
+}
+
 # --- commands ---
 
 cmd_check_one() {
@@ -325,43 +366,14 @@ cmd_check_one() {
 
   echo "== ${service}"
 
-  if [[ "$MODE" == "digest" ]]; then
-    local remote_digest
-    remote_digest=$(fetch_digest "$HOST" "$REPO" "latest") \
-      || die "could not fetch digest for ${REPO}:latest"
-    printf 'current: %s\nlatest:  %s\n' "$cur" "$remote_digest"
-    if [[ "$cur" == "$remote_digest" ]]; then
-      echo "up to date"
-    else
-      printf 'apply:     incus-compose-update apply %s %s\n' "$service" "$remote_digest"
-    fi
+  local new
+  new=$(resolve_latest "$service" "$cur")
+
+  printf 'current: %s\nlatest:  %s\n' "$cur" "$new"
+  if [[ "$cur" == "$new" ]]; then
+    echo "up to date"
   else
-    local tags new
-    if [[ "$HOST" == "docker.io" ]]; then
-      tags=$(fetch_tags_dockerhub "$REPO") || die "could not reach Docker Hub for ${REPO}"
-    else
-      tags=$(fetch_tags_oci "$HOST" "$REPO") || die "could not reach ${HOST} for ${REPO}"
-    fi
-
-    new=$(newest_tag "$tags" "$TAG_RE" "$ORDER") || {
-      echo "no tags matched ${TAG_RE}" >&2
-      echo "upstream may have changed its versioning scheme. Saw:" >&2
-      printf '%s\n' "$tags" | head -8 | sed 's/^/  /' >&2
-      die "update tag_re for ${service} in compose.yaml"
-    }
-
-    # Never move backwards: a computed-newest that sorts older than the pin
-    # is truncation (pagination bug) or a scheme change — make it loud.
-    if [[ "$cur" != "$new" ]] && ! version_gte "$new" "$cur"; then
-      die "upstream newest (${new}) is older than current pin (${cur}) — upstream list looks truncated or the tag scheme changed"
-    fi
-
-    printf 'current: %s\nlatest:  %s\n' "$cur" "$new"
-    if [[ "$cur" == "$new" ]]; then
-      echo "up to date"
-    else
-      printf 'apply:     incus-compose-update apply %s %s\n' "$service" "$new"
-    fi
+    printf 'apply:     incus-compose-update apply %s %s\n' "$service" "$new"
   fi
   echo
 }
@@ -475,7 +487,9 @@ cmd_apply() {
     echo "   logs:       incus --project ${project} console ${service}-1 --show-log"
     echo "   roll back:  incus-compose-update apply ${service} ${cur}"
     [[ -n "$snap" ]] && echo "   or restore: incus --project ${project} storage volume restore ${POOL} ${VOLUME} ${snap}"
-    exit 1
+    # return, not exit: apply-all catches this to stop the run cleanly. The
+    # dispatcher turns a non-zero return back into a non-zero exit status.
+    return 1
   fi
   echo "    ${before:-<none>}"
   echo " -> ${after}"
@@ -495,10 +509,118 @@ cmd_apply() {
   echo "==> done. rollback: incus-compose-update apply ${service} ${cur}"
 }
 
+# apply-all is deliberately sequential, never concurrent. Four things in this
+# script are not safe to run in parallel within a stack:
+#   - write_pin sed -i's a versions.env shared by every service in the stack
+#   - each apply ends in `git commit -- versions.env`, which collides on
+#     .git/index.lock and can capture a peer's half-written pin
+#   - `up --recreate <svc>` starts linked services (no --no-deps), so two
+#     recreates fight over shared dependency containers
+#   - verification exec's into the container; a peer restarting a shared
+#     dependency mid-check reads as a failed update
+# Little is lost by serialising: incus-compose already funnels image pulls
+# through vol-ic-image-lock in its cache project. Sequential also means a
+# failure has exactly one suspect.
+
+cmd_apply_all() {
+  local assume_yes="${1:-0}"
+
+  # --- plan ---
+  #
+  # Every target ref is resolved before anything is mutated: an unreachable
+  # registry or a stale tag_re must fail here, with all stacks still on their
+  # current pins, rather than halfway through a run.
+  local plan=()
+  local dir svc cur new services
+  while IFS= read -r dir; do
+    [[ -f "$dir/compose.yaml" ]] || continue
+    render_stack "$dir"
+    services=$(yq -r '.services | keys[]' "$RENDERED")
+    for svc in $services; do
+      yq -e ".services.\"${svc}\".x-update" "$RENDERED" >/dev/null 2>&1 || continue
+      parse_x_update "$dir" "$svc" "$RENDERED"
+      cur=$(current_pin "$dir/versions.env" "$PIN_VAR")
+      # No pin to move: same "skipping" case check reports, silent here.
+      [[ -n "$cur" ]] || continue
+      new=$(resolve_latest "$svc" "$cur")
+      [[ "$cur" == "$new" ]] && continue
+      plan+=("${dir}"$'\t'"${svc}"$'\t'"${cur}"$'\t'"${new}")
+    done
+    cleanup_render
+  done < <(resolve_stack_dirs)
+
+  if [[ ${#plan[@]} -eq 0 ]]; then
+    echo "everything is up to date"
+    return 0
+  fi
+
+  # --- show the plan ---
+  local entry last_dir=""
+  echo "planned updates:"
+  for entry in "${plan[@]}"; do
+    IFS=$'\t' read -r dir svc cur new <<< "$entry"
+    if [[ "$dir" != "$last_dir" ]]; then
+      echo
+      echo "  stack: ${dir}"
+      last_dir="$dir"
+    fi
+    printf '    %-22s %s -> %s\n' "$svc" "$cur" "$new"
+  done
+  echo
+
+  # --- confirm ---
+  if [[ "$assume_yes" != "1" ]]; then
+    if [[ ! -t 0 ]]; then
+      die "apply-all needs a terminal to confirm — pass --yes for unattended runs"
+    fi
+    local reply
+    read -r -p "recreate ${#plan[@]} service(s), one at a time? [y/N] " reply
+    case "$reply" in
+      y|Y|yes|YES) ;;
+      *) echo "aborted — nothing was changed"; return 0 ;;
+    esac
+    echo
+  fi
+
+  # --- apply, one at a time ---
+  #
+  # cmd_apply re-renders and re-reads the pin for itself rather than trusting
+  # the plan: the pin it writes is the one it just read, so a stale plan can
+  # never cause a wrong pin to be committed.
+  local n=0 total=${#plan[@]}
+  for entry in "${plan[@]}"; do
+    IFS=$'\t' read -r dir svc cur new <<< "$entry"
+    echo "=================================================================="
+    echo "[$((n + 1))/${total}] ${svc}: ${cur} -> ${new}"
+    echo "=================================================================="
+    if ! cmd_apply "$svc" "$new"; then
+      echo
+      echo "!! stopped at ${svc} — ${n} of ${total} applied"
+      echo "   the remaining $((total - n - 1)) service(s) are untouched and still"
+      echo "   on their current pins. Fix this one, then re-run apply-all."
+      return 1
+    fi
+    n=$((n + 1))
+    echo
+  done
+
+  echo "applied ${n} update(s)"
+}
+
 # --- main ---
 
 case "${1:-check}" in
-  check)  shift; cmd_check "${1:-}" ;;
-  apply)  shift; cmd_apply "${1:-}" "${2:-}" ;;
-  *)      die "usage: incus-compose-update {check [service] | apply <service> <ref>}" ;;
+  check)      shift; cmd_check "${1:-}" ;;
+  apply)      shift; cmd_apply "${1:-}" "${2:-}" || exit 1 ;;
+  apply-all)
+    shift
+    ASSUME_YES=0
+    case "${1:-}" in
+      --yes|-y) ASSUME_YES=1 ;;
+      "")       ;;
+      *)        die "unknown option for apply-all: $1" ;;
+    esac
+    cmd_apply_all "$ASSUME_YES" || exit 1
+    ;;
+  *)          die "usage: incus-compose-update {check [service] | apply <service> <ref> | apply-all [--yes]}" ;;
 esac

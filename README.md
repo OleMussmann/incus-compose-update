@@ -21,7 +21,43 @@ Or directly: `nix run github:OleMussmann/incus-compose-update -- --help`
 incus-compose-update check                  compare pinned tags against upstream, all services
 incus-compose-update check <service>        same, scoped to one service
 incus-compose-update apply <service> <ref>  snapshot, pin, recreate, verify
+incus-compose-update apply-all [--yes]      apply every pending update, one at a time
 ```
+
+### `apply-all`
+
+Resolves every pending update across all stack dirs, prints the plan, asks once,
+then runs `apply` for each in turn:
+
+```
+planned updates:
+
+  stack: /srv/stacks/hermes
+    hermes                 v2026.8.13 -> v2026.8.18
+
+  stack: /srv/stacks/search
+    api                    2.11.200 -> 2.11.212
+
+recreate 2 service(s), one at a time? [y/N]
+```
+
+Every target ref is resolved *before* anything is mutated, so an unreachable
+registry or a stale `tag_re` fails with all stacks still on their current pins,
+rather than halfway through a run.
+
+`--yes` skips the prompt for unattended use. Without it, a non-interactive
+invocation refuses rather than assuming consent.
+
+**Sequential, never concurrent.** Services in a stack share one `versions.env`
+that `apply` rewrites in place and commits, `up --recreate` starts linked
+services (no `--no-deps`), and verification exec's into the container — all
+three break under concurrency, while incus-compose already funnels image pulls
+through one lock. Serial also means a failure has exactly one suspect.
+
+**Stops at the first failure.** The failed service prints its usual rollback
+instructions; remaining services are untouched and still on their current pins.
+Fix it, then re-run `apply-all` — already-applied services are up to date by
+then and drop out of the new plan.
 
 ## Configuration
 
@@ -102,3 +138,7 @@ Or set `INCUS_COMPOSE_ENV_FILE='.env,versions.env'` in your shell.
 - **Commit but never push**: pins are committed locally, pushed manually
 - **OCI pagination**: follows `Link` headers to exhaustion on ghcr.io and
   other OCI registries
+- **Plan before mutate**: `apply-all` resolves every target ref up front and
+  aborts the whole run if any of them cannot be resolved
+- **Confirm before recreate**: `apply-all` prompts once, and refuses to run
+  non-interactively unless given `--yes`
