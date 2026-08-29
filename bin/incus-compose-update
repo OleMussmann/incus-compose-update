@@ -342,7 +342,23 @@ resolve_latest() {
 
   # Never move backwards: a computed-newest that sorts older than the pin
   # is truncation (pagination bug) or a scheme change — make it loud.
-  if [[ "$cur" != "$new" ]] && ! version_gte "$new" "$cur"; then
+  #
+  # But compare only the dotted-numeric core for order: pushed. Those tags
+  # carry an opaque build suffix (searxng: 2026.8.28-a30b2d474), and GNU
+  # sort -V compares the leading DIGIT RUN of that suffix numerically:
+  # "9fea41204" reads as 9, "777ba8fa4" as 777, so 2026.8.22-9fea41204 sorts
+  # BELOW 2026.8.22-777ba8fa4. Two builds of the same day therefore order
+  # arbitrarily and the guard fires on a perfectly good update. Push time is
+  # the authority for these anyway — version sort explicitly is not.
+  # Equal cores are same-day rebuilds and legitimately move forward; a truly
+  # older core (2026.8.28 -> 2026.7.1) still dies. Hit live 2026-08-29:
+  # searxng publishes twice a day routinely, making this a coin flip.
+  local guard_new="$new" guard_cur="$cur"
+  if [[ "$ORDER" == "pushed" ]]; then
+    guard_new="${new%%-*}"
+    guard_cur="${cur%%-*}"
+  fi
+  if [[ "$guard_cur" != "$guard_new" ]] && ! version_gte "$guard_new" "$guard_cur"; then
     die "upstream newest (${new}) is older than current pin (${cur}) — upstream list looks truncated or the tag scheme changed"
   fi
 
@@ -396,8 +412,9 @@ cmd_check() {
     done < <(resolve_stack_dirs)
     [[ $found -eq 1 ]] || die "service '${service}' not found in any stack dir"
   else
-    # Each stack is checked independently — one unreachable registry must
-    # not abort the others (that's what the per-stack `if` below is for).
+    # NOTE: not isolated per stack — resolve_latest dies on an unreachable
+    # registry or a stale tag_re, and die exits, so the stacks after it are
+    # never reached. Scope a run with `check <service>` when one is broken.
     while IFS= read -r dir; do
       [[ -f "$dir/compose.yaml" ]] || continue
       echo "== stack: ${dir}"
