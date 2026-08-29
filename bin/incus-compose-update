@@ -108,46 +108,52 @@ cleanup_render() {
 
 # Parse image reference into HOST, REPO and TAG globals.
 #
-# TAG matters: digest mode used to hardcode `latest`, which silently pinned
-# the wrong image for any service whose ref names a different tag. Hermes'
-# buzz-cli-sync is `docker.io/debian:13-slim@${DEBIAN_DIGEST}` — it was being
-# handed the digest of `debian:latest` (the full, non-slim Debian), so the ref
-# still *read* 13-slim while resolving to something else entirely. Hit live
-# 2026-08-29.
+# Order matters: strip the digest, then the tag, and only then split off the
+# host. The previous version cut at the FIRST ':' to get the bare name, which
+# silently destroyed two things:
+#
+#   1. The tag. Digest mode then asked the registry for a hardcoded `latest`
+#      no matter what the ref said, so Hermes' buzz-cli-sync
+#      (`docker.io/debian:13-slim@${DEBIAN_DIGEST}`) was handed the digest of
+#      debian:latest — the full, non-slim image. The ref still read 13-slim
+#      while resolving to something else. Hit live 2026-08-29.
+#
+#   2. A registry port. `registry.local:5000/team/app` became the bare name
+#      `registry.local`, which then parsed as the Docker Hub official image
+#      `library/registry.local`. The `*:*` test below was already written to
+#      recognise a ported host, but could never fire, because the port had
+#      been cut off two lines earlier.
 parse_image_ref() {
   local ref="$1"
-  local bare="${ref%%:*}"
-  bare="${bare%%@*}"
 
-  # Tag lives between the last ':' and the digest, but only when that trailing
-  # segment holds no '/': in `host:5000/repo` the ':' introduces a port, not a
-  # tag. A ref with no tag means `latest`, same as any registry client.
-  local no_digest="${ref%%@*}"
+  # Digest first — everything after '@' is opaque.
+  local name="${ref%%@*}"
+
+  # Then the tag: the part after the LAST ':', but only when it holds no '/'.
+  # In `host:5000/repo` that colon introduces a port, not a tag. A ref with no
+  # tag means `latest`, same as any registry client.
   TAG="latest"
-  if [[ "$no_digest" == *:* ]]; then
-    local maybe_tag="${no_digest##*:}"
-    [[ "$maybe_tag" == */* ]] || TAG="$maybe_tag"
+  local last="${name##*:}"
+  if [[ "$name" == *:* && "$last" != */* ]]; then
+    TAG="$last"
+    name="${name%:*}"
   fi
 
-  local IFS='/'
-  read -ra parts <<< "$bare"
-
-  if [[ ${#parts[@]} -eq 1 ]]; then
-    # Single segment: docker.io/library/<repo>
-    HOST="docker.io"
-    REPO="library/${parts[0]}"
-  elif [[ "${parts[0]}" == *.* || "${parts[0]}" == *:* ]]; then
-    # First segment contains . or : — it's a host
-    HOST="${parts[0]}"
-    REPO="${parts[*]:1}"
-    # docker.io uses library/ for single-segment official images
-    if [[ "$HOST" == "docker.io" && "$REPO" != */* ]]; then
-      REPO="library/${REPO}"
-    fi
+  # What is left is the name. Its first path segment is a registry host when
+  # it looks like one: a dot (registry.example.com), a port (registry:5000),
+  # or literally localhost. Anything else is a Docker Hub namespace.
+  local first="${name%%/*}"
+  if [[ "$name" == */* && ( "$first" == *.* || "$first" == *:* || "$first" == "localhost" ) ]]; then
+    HOST="$first"
+    REPO="${name#*/}"
   else
-    # No host specified — defaults to docker.io
     HOST="docker.io"
-    REPO="$bare"
+    REPO="$name"
+  fi
+
+  # docker.io namespaces single-segment official images under library/
+  if [[ "$HOST" == "docker.io" && "$REPO" != */* ]]; then
+    REPO="library/${REPO}"
   fi
 }
 
@@ -325,6 +331,33 @@ version_of() {
   # must be supplied or interpolated ${VAR}s render blank and the command
   # fails before ever reaching the container.
   ( cd "$stack_dir" && incus-compose --env-file .env --env-file versions.env exec "$service" -- "$@" 2>/dev/null ) || true
+}
+
+# What image the instance was actually created from — the authoritative answer
+# to "was it recreated on the new pin", and the thing a version string only
+# ever approximated.
+#
+# Two keys carry it, and either alone settles it, so a match on either passes
+# and the check survives one of them changing shape:
+#   image.id          set by Incus from the OCI descriptor, host-less:
+#                     searxng/searxng:2026.8.28-a30b2d474
+#                     library/debian@sha256:d7e12182...
+#   user.image_alias  stamped by incus-compose, host-qualified:
+#                     docker.io/searxng/searxng:2026.8.28-a30b2d474
+# Verified against all six instances across docker.io and ghcr.io on
+# incus 7.3.0 / incus-compose 1.2.0.
+instance_image_id() {
+  incus --project "$1" config get "$2" image.id 2>/dev/null || true
+}
+
+instance_image_alias() {
+  incus --project "$1" config get "$2" user.image_alias 2>/dev/null || true
+}
+
+# A pin is either a digest (sha256:...) or a tag, and the ref joins them with
+# '@' or ':' respectively.
+ref_separator() {
+  [[ "$1" == sha256:* ]] && echo "@" || echo ":"
 }
 
 # --- upstream resolution ---
@@ -512,37 +545,91 @@ cmd_apply() {
   # service it declines with "resource is already running" and leaves the
   # process untouched, so this is a no-op on the happy path — hence the
   # swallowed output. A start that genuinely fails still surfaces, as the
-  # readiness check below will not see a new version.
+  # readiness check below will not see the instance come back.
   incus_compose "$stack_dir" start "$service" >/dev/null 2>&1 || true
 
-  # Wait for readiness
+  # --- verify ---
+  #
+  # Two independent facts, checked separately because neither implies the
+  # other: the instance was rebuilt on the new ref, and it came back up.
+  #
+  # This used to be inferred from a single signal — "the version string
+  # changed" — which cannot work for a digest-pinned base image. Two rebuilds
+  # of debian:13-slim are both Debian 13.6, so buzz-cli-sync's
+  # `cat /etc/debian_version` reads 13.6 on both sides of a perfectly good
+  # update. apply then declared failure and suggested a rollback that failed
+  # identically, for the same reason, in the other direction. Hit live
+  # 2026-08-29. Image identity is the fact that actually answers the question;
+  # the probe now only has to show the container is alive.
+  local instance="${service}-1"
+
   echo "==> waiting for readiness"
-  local after=""
+  local after="" ready=0
   for _ in $(seq 1 "$READY_TRIES"); do
     sleep "$READY_INTERVAL"
     after=$(version_of "$stack_dir" "$service" "${VERSION_CMD[@]}")
-    [[ -n "$after" && "$after" != "$before" ]] && break
+    if [[ -n "$after" ]]; then ready=1; break; fi
     printf '.'
   done
   echo
 
   incus_compose "$stack_dir" ps
 
-  if [[ -z "$after" || "$after" == "$before" ]]; then
+  local sep want_id want_alias got_id got_alias
+  sep=$(ref_separator "$ref")
+  want_id="${REPO}${sep}${ref}"
+  want_alias="${HOST}/${REPO}${sep}${ref}"
+  got_id=$(instance_image_id "$project" "$instance")
+  got_alias=$(instance_image_alias "$project" "$instance")
+
+  if [[ -z "$got_id" && -z "$got_alias" ]]; then
     echo
-    echo "!! verification failed after $((READY_TRIES * READY_INTERVAL))s"
-    echo "   before: ${before:-<none>}"
-    echo "   after:  ${after:-<no output>}"
-    echo "   identical output usually means the instance was not recreated."
-    echo "   logs:       incus --project ${project} console ${service}-1 --show-log"
+    echo "!! cannot read image identity of ${project}:${instance}"
+    echo "   expected image.id: ${want_id}"
+    echo "   neither image.id nor user.image_alias is set — wrong instance name,"
+    echo "   or this Incus/incus-compose no longer records it."
+    echo "   inspect:    incus --project ${project} config show ${instance}"
+    echo "   roll back:  incus-compose-update apply ${service} ${cur}"
+    [[ -n "$snap" ]] && echo "   or restore: incus --project ${project} storage volume restore ${POOL} ${VOLUME} ${snap}"
+    return 1
+  fi
+
+  if [[ "$got_id" != "$want_id" && "$got_alias" != "$want_alias" ]]; then
+    echo
+    echo "!! ${instance} is not running the new image"
+    echo "   wanted: ${want_id}"
+    echo "   got:    ${got_id:-${got_alias}}"
+    echo "   the recreate did not take — the instance still holds its old image."
+    echo "   logs:       incus --project ${project} console ${instance} --show-log"
     echo "   roll back:  incus-compose-update apply ${service} ${cur}"
     [[ -n "$snap" ]] && echo "   or restore: incus --project ${project} storage volume restore ${POOL} ${VOLUME} ${snap}"
     # return, not exit: apply-all catches this to stop the run cleanly. The
     # dispatcher turns a non-zero return back into a non-zero exit status.
     return 1
   fi
-  echo "    ${before:-<none>}"
-  echo " -> ${after}"
+
+  if [[ $ready -eq 0 ]]; then
+    echo
+    echo "!! ${instance} is on the new image but did not respond in $((READY_TRIES * READY_INTERVAL))s"
+    echo "   image:  ${want_id}"
+    echo "   probe:  ${VERSION_CMD[*]}"
+    echo "   it produced no output — the container may still be booting, may be"
+    echo "   crash-looping, or the probe itself may be wrong for this image."
+    echo "   logs:       incus --project ${project} console ${instance} --show-log"
+    echo "   roll back:  incus-compose-update apply ${service} ${cur}"
+    [[ -n "$snap" ]] && echo "   or restore: incus --project ${project} storage volume restore ${POOL} ${VOLUME} ${snap}"
+    return 1
+  fi
+
+  echo "==> verified ${want_id}"
+  # An unchanged version string is normal for a digest-pinned base image and
+  # no longer means anything is wrong — report it, do not judge it.
+  if [[ "$after" == "$before" ]]; then
+    echo "    ${after} (unchanged — rebuild of the same release)"
+  else
+    echo "    ${before:-<none>}"
+    echo " -> ${after}"
+  fi
 
   # Commit but never push. Auto-pushing adds auth prompts, rejected pushes
   # and branch-protection failures to a run that just succeeded. Unpushed

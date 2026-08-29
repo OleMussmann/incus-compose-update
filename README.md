@@ -136,7 +136,14 @@ Or set `INCUS_COMPOSE_ENV_FILE='.env,versions.env'` in your shell.
 
 - **Backwards guard**: errors if computed newest is older than current pin
 - **Snapshot before recreate**: configurable per-service via `volume`
-- **Verify after recreate**: compares running version before/after
+- **Verify after recreate**: checks the instance's own record of the image it
+  was built from (`image.id` / `user.image_alias`) against the new pin, then
+  that the container answers `version_cmd` at all. Image identity is the fact
+  that settles whether the recreate took; the version string is only a
+  liveness probe, and is allowed to be unchanged — two rebuilds of a
+  digest-pinned base image report the same release (`debian:13-slim` is
+  `13.6` before and after), which the old before/after comparison mistook for
+  a failed update, and then mistook again on the rollback it suggested
 - **Commit but never push**: pins are committed locally, pushed manually
 - **OCI pagination**: follows `Link` headers to exhaustion on ghcr.io and
   other OCI registries
