@@ -106,11 +106,28 @@ cleanup_render() {
 
 # --- image reference parsing ---
 
-# Parse image reference into HOST and REPO globals (strips tag/digest).
+# Parse image reference into HOST, REPO and TAG globals.
+#
+# TAG matters: digest mode used to hardcode `latest`, which silently pinned
+# the wrong image for any service whose ref names a different tag. Hermes'
+# buzz-cli-sync is `docker.io/debian:13-slim@${DEBIAN_DIGEST}` — it was being
+# handed the digest of `debian:latest` (the full, non-slim Debian), so the ref
+# still *read* 13-slim while resolving to something else entirely. Hit live
+# 2026-08-29.
 parse_image_ref() {
   local ref="$1"
   local bare="${ref%%:*}"
   bare="${bare%%@*}"
+
+  # Tag lives between the last ':' and the digest, but only when that trailing
+  # segment holds no '/': in `host:5000/repo` the ':' introduces a port, not a
+  # tag. A ref with no tag means `latest`, same as any registry client.
+  local no_digest="${ref%%@*}"
+  TAG="latest"
+  if [[ "$no_digest" == *:* ]]; then
+    local maybe_tag="${no_digest##*:}"
+    [[ "$maybe_tag" == */* ]] || TAG="$maybe_tag"
+  fi
 
   local IFS='/'
   read -ra parts <<< "$bare"
@@ -139,7 +156,7 @@ parse_image_ref() {
 # Reads x-update metadata from the rendered config (RENDERED) and the pin
 # variable name from the raw compose.yaml (rendering interpolates ${VAR}
 # away). Sets globals: MODE, TAG_RE, ORDER, VOLUME, VERSION_CMD, IMAGE,
-# PIN_VAR, HOST, REPO.
+# PIN_VAR, HOST, REPO, TAG.
 
 pin_var_from_raw() {
   local raw_compose="$1" service="$2"
@@ -321,8 +338,9 @@ resolve_latest() {
   local service="$1" cur="$2"
 
   if [[ "$MODE" == "digest" ]]; then
-    fetch_digest "$HOST" "$REPO" "latest" \
-      || die "could not fetch digest for ${REPO}:latest"
+    # The tag from the image ref, not a hardcoded `latest` — see parse_image_ref.
+    fetch_digest "$HOST" "$REPO" "$TAG" \
+      || die "could not fetch digest for ${REPO}:${TAG}"
     return 0
   fi
 

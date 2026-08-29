@@ -91,7 +91,7 @@ services:
 
 | Key | Values | Default | Meaning |
 |---|---|---|---|
-| `mode` | `tag` \| `digest` | `tag` | Pin a tag, or a digest for `latest`-only images |
+| `mode` | `tag` \| `digest` | `tag` | Pin a tag, or a digest of the tag in `image:` |
 | `tag_re` | ERE string | — | Required for `mode: tag`; filters upstream tags |
 | `order` | `version` \| `pushed` | `version` | How to pick newest among matches |
 | `volume` | volume name \| `none` | `none` | Volume to snapshot before recreate |
@@ -107,10 +107,12 @@ services:
 **Tag mode** (`mode: tag`): filters upstream tags by `tag_re`, selects newest
 by version sort or push order, pins the tag string.
 
-**Digest mode** (`mode: digest`): fetches the digest of `latest`, pins the
-digest string. Use for images that only publish `latest` (no versioned tags).
-The image reference stays `repo:latest@sha256:...` so the human-readable label
-survives.
+**Digest mode** (`mode: digest`): fetches the digest of **the tag named in
+`image:`**, pins the digest string. Use for images that publish no useful
+versioned tags, or a rolling tag you want held still. The image reference
+keeps its tag (`repo:13-slim@sha256:...`) so the human-readable label
+survives — and the tag is what gets resolved, so the label and the digest
+always describe the same image.
 
 ## Pin file
 
@@ -138,6 +140,8 @@ Or set `INCUS_COMPOSE_ENV_FILE='.env,versions.env'` in your shell.
 - **Commit but never push**: pins are committed locally, pushed manually
 - **OCI pagination**: follows `Link` headers to exhaustion on ghcr.io and
   other OCI registries
+- **Digest mode follows the ref's tag**, never a hardcoded `latest` — a pin
+  can't drift onto a different image than the one `image:` names
 - **Plan before mutate**: `apply-all` resolves every target ref up front and
   aborts the whole run if any of them cannot be resolved
 - **Confirm before recreate**: `apply-all` prompts once, and refuses to run
