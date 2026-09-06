@@ -522,7 +522,11 @@ cmd_apply() {
   if [[ "$VOLUME" != "none" ]]; then
     snap="pre-${ref}-$(date +%Y%m%d%H%M)"
     echo "==> snapshotting ${project}:${POOL}/${VOLUME} as ${snap}"
-    incus --project "$project" storage volume snapshot create "$POOL" "$VOLUME" "$snap"
+    # --no-expiry: a rollback point has to outlive the volume's own retention.
+    # Without it the server fills the expiry from snapshots.expiry.manual,
+    # falling back to snapshots.expiry, so a volume on a daily schedule would
+    # prune its pre-upgrade snapshots along with the scheduled ones.
+    incus --project "$project" storage volume snapshot create --no-expiry "$POOL" "$VOLUME" "$snap"
   fi
 
   # Pin
