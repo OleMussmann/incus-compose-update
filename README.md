@@ -69,6 +69,7 @@ Environment variables:
 | `STACK_DIR` | single-stack directory | alternative to `STACK_DIRS` |
 | `INCUS_POOL` | storage pool | `local` |
 | `INCUS_PROJECT` | Incus project | detected from `compose.yaml` |
+| `AUTO_PUSH` | push each pin commit | `1` (set `0` to commit only) |
 
 ## The `x-update:` schema
 
@@ -132,6 +133,51 @@ incus-compose --env-file .env --env-file versions.env up -d
 
 Or set `INCUS_COMPOSE_ENV_FILE='.env,versions.env'` in your shell.
 
+## Several checkouts, one server
+
+`versions.env` is a *record of what one server runs*, and more than one
+checkout usually describes that same server — two workstations that are both
+just interfaces to the same Incus host. Freshness is therefore a correctness
+property, not tidiness. A stale checkout:
+
+- misreports the running version (`check` reads its pin, not the server),
+- writes a `from` version into its commit message that was never deployed,
+- and can roll the server **backwards** on a plain `incus-compose up`, which
+  interpolates image refs from whatever `versions.env` is in that tree.
+
+So a run:
+
+1. **pulls first.** Each stack dir is fetched and rebased onto its upstream
+   before any pin is read — during `apply-all`'s planning phase, so the plan
+   is built from pins that match the server. `check` only warns, since asking
+   what is out of date should not rewrite your tree.
+2. **checks the pin against the server.** Before the snapshot, the pin being
+   moved is compared to the instance's own `image.id` / `user.image_alias`.
+   If they disagree, this checkout does not describe the server and the run
+   stops with nothing touched. The exception is applying the ref the instance
+   *already* runs — that moves the record towards reality, and is the rollback
+   printed when a recreate fails to take.
+3. **pushes the commit.** Set `AUTO_PUSH=0` to commit without pushing.
+
+Git failures are reported but never fatal to a verified deploy: by the time
+the push runs, the container is already up and its image identity confirmed,
+so a rejected push means the record lagged, not that the update failed. A push
+rejected by a concurrent update from the other checkout is retried once after
+a rebase. Network git is forced non-interactive (`GIT_TERMINAL_PROMPT=0`,
+ssh `BatchMode=yes`) so a credential prompt fails fast instead of hanging
+mid-run.
+
+Two cases stop the run rather than guess, because only a human knows which
+side is right:
+
+- **both checkouts moved the same pin** — the rebase conflicts, is aborted,
+  and the tree is left untouched. The server is the tiebreaker: whatever it
+  runs now is the truth.
+- **`versions.env` is dirty and the tree is behind** — almost always a pin
+  written by an `apply` that then failed before committing. Rebasing over it
+  would either stash a pin that is actually deployed or conflict on the very
+  line about to be rewritten.
+
 ## Safety
 
 - **Backwards guard**: errors if computed newest is older than current pin
@@ -144,7 +190,10 @@ Or set `INCUS_COMPOSE_ENV_FILE='.env,versions.env'` in your shell.
   digest-pinned base image report the same release (`debian:13-slim` is
   `13.6` before and after), which the old before/after comparison mistook for
   a failed update, and then mistook again on the rollback it suggested
-- **Commit but never push**: pins are committed locally, pushed manually
+- **Pull before, push after**: see [Several checkouts, one
+  server](#several-checkouts-one-server)
+- **Refuses to apply from a stale checkout**: if the pin being moved is not
+  what the instance actually runs, the run stops before the snapshot
 - **OCI pagination**: follows `Link` headers to exhaustion on ghcr.io and
   other OCI registries
 - **Digest mode follows the ref's tag**, never a hardcoded `latest` — a pin

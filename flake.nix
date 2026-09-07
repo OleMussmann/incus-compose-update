@@ -26,6 +26,7 @@
             name = "incus-compose-update";
             runtimeInputs = with pkgs; [
               git
+              openssh # push over ssh remotes; not on PATH in a systemd unit
               coreutils
               gnused
               gnugrep

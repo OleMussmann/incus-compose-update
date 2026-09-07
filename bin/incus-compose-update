@@ -18,11 +18,18 @@
 #   apply <service> <ref>  snapshot, pin, recreate, verify
 #   apply-all [--yes]      apply every pending update, sequentially
 #
+# Git: versions.env records what one server runs, and more than one checkout
+# describes that same server. So a run pulls before it reads any pin, refuses
+# to apply when the pin does not match the running instance, and pushes the
+# commit it writes. A git failure is reported but never fails a verified
+# deploy.
+#
 # Environment:
 #   STACK_DIRS    colon-separated stack directories (required, or STACK_DIR)
 #   STACK_DIR     single-stack directory (alternative to STACK_DIRS)
 #   INCUS_POOL    storage pool (default: local)
 #   INCUS_PROJECT incus project (default: detected from rendered config)
+#   AUTO_PUSH     push each pin commit (default: 1; set 0 to commit only)
 
 set -euo pipefail
 
@@ -42,6 +49,12 @@ config (environment):
   STACK_DIR     single-stack directory (alternative to STACK_DIRS)
   INCUS_POOL    storage pool (default: local)
   INCUS_PROJECT incus project (default: detected from rendered config)
+  AUTO_PUSH     push each pin commit (default: 1; set 0 to commit only)
+
+git:
+  A run pulls each stack dir before reading its pins, refuses to apply when a
+  pin does not match the running instance, and pushes the commit it writes.
+  Git problems are reported, never fatal to a verified deploy.
 EOF
 }
 
@@ -307,6 +320,138 @@ write_pin() {
   fi
 }
 
+# --- git sync ---
+#
+# versions.env is a record of what one server runs, and several checkouts
+# describe that same server. Freshness is therefore a correctness property,
+# not tidiness: a stale tree misreports the running version, writes a "from"
+# version into its commit message that was never deployed, and can roll the
+# server back on a plain `incus-compose up`. So pull before reading pins, push
+# after writing them, and never let a git failure fail a deploy that worked.
+
+declare -A GIT_SYNCED=()
+
+git_is_repo() {
+  git -C "$1" rev-parse --git-dir >/dev/null 2>&1
+}
+
+git_has_upstream() {
+  git -C "$1" rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1
+}
+
+# Network git, forced non-interactive. A credential prompt that hangs halfway
+# through an update run is worse than a fetch that fails and says so. This is
+# the "auth prompts" half of the old never-push rationale, closed rather than
+# avoided by not pushing.
+git_net() {
+  GIT_TERMINAL_PROMPT=0 \
+  GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes" \
+  git "$@"
+}
+
+# Bring a stack dir up to date with origin before its pins are read. Runs at
+# most once per dir per invocation: apply-all syncs during planning, and the
+# per-service cmd_apply calls that follow are then no-ops.
+git_sync_in() {
+  local stack_dir="$1"
+  [[ -n "${GIT_SYNCED[$stack_dir]:-}" ]] && return 0
+  GIT_SYNCED[$stack_dir]=1
+
+  git_is_repo "$stack_dir" || return 0
+  if ! git_has_upstream "$stack_dir"; then
+    echo "==> ${stack_dir}: no upstream branch — skipping pull"
+    return 0
+  fi
+
+  if ! git_net -C "$stack_dir" fetch --quiet 2>/dev/null; then
+    echo "==> ${stack_dir}: fetch failed — working from the local tree as-is."
+    echo "    If the other checkout has pushed since, this tree is stale."
+    return 0
+  fi
+
+  local counts behind ahead
+  counts=$(git -C "$stack_dir" rev-list --left-right --count 'HEAD...@{upstream}' 2>/dev/null) || return 0
+  ahead=$(echo "$counts" | cut -f1)
+  behind=$(echo "$counts" | cut -f2)
+  [[ "$behind" == "0" ]] && return 0
+
+  # A dirty versions.env here is a pin written by an apply that then failed
+  # before committing. Rebasing over it would either stash a pin that is
+  # actually deployed or conflict on the very line we are about to rewrite.
+  if ! git -C "$stack_dir" diff --quiet -- versions.env 2>/dev/null; then
+    echo "!! ${stack_dir} is ${behind} commit(s) behind origin, and versions.env has"
+    echo "   uncommitted changes — most likely a pin left behind by a failed apply."
+    echo "   Settle it by hand before updating:"
+    echo "     git -C ${stack_dir} diff versions.env"
+    die "refusing to rebase over an uncommitted pin"
+  fi
+
+  echo "==> ${stack_dir}: ${behind} behind, ${ahead} ahead — rebasing onto origin"
+  if ! git -C "$stack_dir" rebase --quiet '@{upstream}' >/dev/null 2>&1; then
+    git -C "$stack_dir" rebase --abort >/dev/null 2>&1 || true
+    echo "!! rebase onto origin conflicted in ${stack_dir}; it was aborted, so the"
+    echo "   tree is untouched. Both checkouts moved the same pin. The server is"
+    echo "   the tiebreaker — whatever it runs now is the truth:"
+    echo "     git -C ${stack_dir} log --oneline 'HEAD..@{upstream}'"
+    die "cannot rebase ${stack_dir} onto origin"
+  fi
+}
+
+# Read-only freshness check for `check`, which must not rewrite the tree just
+# because someone asked what is out of date.
+git_warn_if_stale() {
+  local stack_dir="$1"
+  git_is_repo "$stack_dir" || return 0
+  git_has_upstream "$stack_dir" || return 0
+  git_net -C "$stack_dir" fetch --quiet 2>/dev/null || return 0
+
+  local behind
+  behind=$(git -C "$stack_dir" rev-list --count 'HEAD..@{upstream}' 2>/dev/null) || return 0
+  if [[ "$behind" != "0" ]]; then
+    echo "!! ${stack_dir} is ${behind} commit(s) behind origin — the pins below may"
+    echo "   not be what the server runs. Pull before trusting them:"
+    echo "     git -C ${stack_dir} pull --rebase"
+    echo
+  fi
+}
+
+# Push a committed pin. Never fatal: by the time this runs the deploy has
+# already succeeded and been verified against the instance's image identity,
+# so a rejected push means the record lagged, not that the update failed.
+git_sync_out() {
+  local stack_dir="$1"
+
+  if [[ "${AUTO_PUSH:-1}" != "1" ]]; then
+    echo "    not pushed (AUTO_PUSH=${AUTO_PUSH}): git -C ${stack_dir} push"
+    return 0
+  fi
+
+  if ! git_has_upstream "$stack_dir"; then
+    echo "    not pushed — no upstream branch configured"
+    return 0
+  fi
+
+  if git_net -C "$stack_dir" push --quiet 2>/dev/null; then
+    echo "    pushed"
+    return 0
+  fi
+
+  # A rejection means the other checkout pushed between our sync and now. One
+  # rebase-and-retry covers that race; anything else is a human's problem.
+  if git_net -C "$stack_dir" fetch --quiet 2>/dev/null \
+    && git -C "$stack_dir" rebase --quiet '@{upstream}' >/dev/null 2>&1 \
+    && git_net -C "$stack_dir" push --quiet 2>/dev/null; then
+    echo "    pushed (after rebasing onto a concurrent update)"
+    return 0
+  fi
+  git -C "$stack_dir" rebase --abort >/dev/null 2>&1 || true
+
+  echo "    !! push failed — the pin is committed here but not on origin."
+  echo "       The server is updated and verified; this is a git problem only."
+  echo "       retry: git -C ${stack_dir} push"
+  return 0
+}
+
 # --- incus operations ---
 
 detect_project() {
@@ -358,6 +503,27 @@ instance_image_alias() {
 # '@' or ':' respectively.
 ref_separator() {
   [[ "$1" == sha256:* ]] && echo "@" || echo ":"
+}
+
+# Is the instance running $ref? Uses the REPO/HOST globals parse_x_update set,
+# and exports WANT_ID/WANT_ALIAS/GOT_ID/GOT_ALIAS so callers can report on a
+# mismatch. Returns 0 match, 1 mismatch, 2 no identity recorded.
+#
+# Two callers, asking the same question at opposite ends of an apply: before,
+# "does the pin we are about to move match reality?" (a stale checkout if not);
+# after, "did the recreate take?".
+instance_ref_status() {
+  local project="$1" instance="$2" ref="$3"
+  local sep
+  sep=$(ref_separator "$ref")
+  WANT_ID="${REPO}${sep}${ref}"
+  WANT_ALIAS="${HOST}/${REPO}${sep}${ref}"
+  GOT_ID=$(instance_image_id "$project" "$instance")
+  GOT_ALIAS=$(instance_image_alias "$project" "$instance")
+
+  [[ -z "$GOT_ID" && -z "$GOT_ALIAS" ]] && return 2
+  [[ "$GOT_ID" == "$WANT_ID" || "$GOT_ALIAS" == "$WANT_ALIAS" ]] && return 0
+  return 1
 }
 
 # --- upstream resolution ---
@@ -454,6 +620,7 @@ cmd_check() {
       [[ -f "$dir/compose.yaml" ]] || continue
       render_stack "$dir"
       if yq -e ".services.\"${service}\"" "$RENDERED" >/dev/null 2>&1; then
+        git_warn_if_stale "$dir"
         cmd_check_one "$dir" "$service"
         found=1
         cleanup_render
@@ -469,6 +636,7 @@ cmd_check() {
     while IFS= read -r dir; do
       [[ -f "$dir/compose.yaml" ]] || continue
       echo "== stack: ${dir}"
+      git_warn_if_stale "$dir"
       render_stack "$dir"
       local services
       services=$(yq -r '.services | keys[]' "$RENDERED")
@@ -498,6 +666,13 @@ cmd_apply() {
   done < <(resolve_stack_dirs)
   [[ -n "$stack_dir" ]] || die "service '${service}' not found in any stack dir"
 
+  # The render above only had to locate the service. Freshen the checkout now,
+  # before any pin is read, and render again: a pull moves versions.env, and
+  # every pin below has to come from the post-pull tree.
+  cleanup_render
+  git_sync_in "$stack_dir"
+  render_stack "$stack_dir"
+
   local env_file="$stack_dir/versions.env"
   [[ -f "$env_file" ]] || touch "$env_file"
 
@@ -513,6 +688,47 @@ cmd_apply() {
   project="${INCUS_PROJECT:-$project}"
 
   preflight "$project" "$VOLUME"
+
+  local instance="${service}-1"
+
+  # Is the pin we are about to move the one actually running? If not, this
+  # checkout does not describe the server: the commit would record a "from"
+  # version that was never deployed, and the git tree it lands in is the same
+  # tree a plain `incus-compose up` would deploy from. Stop before the
+  # snapshot, while nothing has been touched.
+  local live=0 target=0
+  instance_ref_status "$project" "$instance" "$cur" || live=$?
+  if [[ $live -eq 1 ]]; then
+    # One exception, and it matters: if the ref being applied is what the
+    # instance already runs, this apply moves the record TOWARDS reality, not
+    # away from it. That is precisely the rollback printed when a recreate
+    # fails to take (pin already advanced, instance still on the old image),
+    # so blocking it would wall off the documented recovery path.
+    instance_ref_status "$project" "$instance" "$ref" || target=$?
+    if [[ $target -eq 0 ]]; then
+      echo "==> note: versions.env pins ${cur}, but ${instance} already runs ${ref}."
+      echo "    Applying it brings the record back in line with the server."
+    else
+      echo "!! ${stack_dir} does not match the server"
+      echo "   versions.env pins ${service} at: ${cur}"
+      echo "   ${instance} is actually running:  ${GOT_ALIAS:-${GOT_ID}}"
+      echo
+      echo "   Either another checkout updated this service, or the server was"
+      echo "   changed outside this tool. Applying from here would record a"
+      echo "   change that never happened, and this same tree is what a plain"
+      echo "   'incus-compose up' would deploy from."
+      echo "   fix: git -C ${stack_dir} pull --rebase"
+      if [[ -n "$GOT_ALIAS" ]]; then
+        echo "   or, to adopt what the server already runs:"
+        echo "        incus-compose-update apply ${service} ${GOT_ALIAS##*[:@]}"
+      fi
+      return 1
+    fi
+  fi
+  if [[ $live -eq 2 ]]; then
+    echo "==> note: ${instance} records no image identity, so the current pin"
+    echo "    cannot be confirmed against the server. Proceeding."
+  fi
 
   local before
   before=$(version_of "$stack_dir" "$service" "${VERSION_CMD[@]}")
@@ -565,8 +781,6 @@ cmd_apply() {
   # identically, for the same reason, in the other direction. Hit live
   # 2026-08-29. Image identity is the fact that actually answers the question;
   # the probe now only has to show the container is alive.
-  local instance="${service}-1"
-
   echo "==> waiting for readiness"
   local after="" ready=0
   for _ in $(seq 1 "$READY_TRIES"); do
@@ -579,17 +793,13 @@ cmd_apply() {
 
   incus_compose "$stack_dir" ps
 
-  local sep want_id want_alias got_id got_alias
-  sep=$(ref_separator "$ref")
-  want_id="${REPO}${sep}${ref}"
-  want_alias="${HOST}/${REPO}${sep}${ref}"
-  got_id=$(instance_image_id "$project" "$instance")
-  got_alias=$(instance_image_alias "$project" "$instance")
+  local ident=0
+  instance_ref_status "$project" "$instance" "$ref" || ident=$?
 
-  if [[ -z "$got_id" && -z "$got_alias" ]]; then
+  if [[ $ident -eq 2 ]]; then
     echo
     echo "!! cannot read image identity of ${project}:${instance}"
-    echo "   expected image.id: ${want_id}"
+    echo "   expected image.id: ${WANT_ID}"
     echo "   neither image.id nor user.image_alias is set — wrong instance name,"
     echo "   or this Incus/incus-compose no longer records it."
     echo "   inspect:    incus --project ${project} config show ${instance}"
@@ -598,11 +808,11 @@ cmd_apply() {
     return 1
   fi
 
-  if [[ "$got_id" != "$want_id" && "$got_alias" != "$want_alias" ]]; then
+  if [[ $ident -eq 1 ]]; then
     echo
     echo "!! ${instance} is not running the new image"
-    echo "   wanted: ${want_id}"
-    echo "   got:    ${got_id:-${got_alias}}"
+    echo "   wanted: ${WANT_ID}"
+    echo "   got:    ${GOT_ID:-${GOT_ALIAS}}"
     echo "   the recreate did not take — the instance still holds its old image."
     echo "   logs:       incus --project ${project} console ${instance} --show-log"
     echo "   roll back:  incus-compose-update apply ${service} ${cur}"
@@ -615,7 +825,7 @@ cmd_apply() {
   if [[ $ready -eq 0 ]]; then
     echo
     echo "!! ${instance} is on the new image but did not respond in $((READY_TRIES * READY_INTERVAL))s"
-    echo "   image:  ${want_id}"
+    echo "   image:  ${WANT_ID}"
     echo "   probe:  ${VERSION_CMD[*]}"
     echo "   it produced no output — the container may still be booting, may be"
     echo "   crash-looping, or the probe itself may be wrong for this image."
@@ -625,7 +835,7 @@ cmd_apply() {
     return 1
   fi
 
-  echo "==> verified ${want_id}"
+  echo "==> verified ${WANT_ID}"
   # An unchanged version string is normal for a digest-pinned base image and
   # no longer means anything is wrong — report it, do not judge it.
   if [[ "$after" == "$before" ]]; then
@@ -635,14 +845,15 @@ cmd_apply() {
     echo " -> ${after}"
   fi
 
-  # Commit but never push. Auto-pushing adds auth prompts, rejected pushes
-  # and branch-protection failures to a run that just succeeded. Unpushed
-  # pins drift between machines though — say so rather than stay silent.
+  # Commit and push. The old rule here was "commit but never push", to keep
+  # auth prompts and rejected pushes out of a run that had just succeeded. But
+  # the checkouts describe one shared server, so an unpushed pin leaves every
+  # other checkout believing something false about it — a worse failure than a
+  # noisy push. The prompts are handled by git_net forcing non-interactive, and
+  # a rejected push is reported without failing the run.
   if git -C "$stack_dir" commit -q -m "${service}: ${cur} -> ${ref}" -- "$env_file" 2>/dev/null; then
-    echo "==> pinned and committed (not pushed)"
-    if git -C "$stack_dir" remote | grep -q .; then
-      echo "    push when ready: git -C ${stack_dir} push"
-    fi
+    echo "==> pinned and committed"
+    git_sync_out "$stack_dir"
   else
     echo "==> pinned (not committed — no repo, or nothing to commit)"
   fi
@@ -675,6 +886,9 @@ cmd_apply_all() {
   local dir svc cur new services
   while IFS= read -r dir; do
     [[ -f "$dir/compose.yaml" ]] || continue
+    # Sync before planning, not per-apply: the plan has to be built from pins
+    # that match the server, and cmd_apply's own git_sync_in is then a no-op.
+    git_sync_in "$dir"
     render_stack "$dir"
     services=$(yq -r '.services | keys[]' "$RENDERED")
     for svc in $services; do
