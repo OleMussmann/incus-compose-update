@@ -140,15 +140,19 @@ cleanup_render() {
 # __root__ keeps services that have no edges in the output; tsort emits only
 # nodes that appear in some pair. A depends_on cycle makes tsort fail, and the
 # fallback is render order — a bad order beats skipping the stack entirely.
+#
 services_in_dep_order() {
   local rendered="$1" ordered=""
+  # One line per service: its name, then the names it depends on. awk turns
+  # that into tsort's "<comes first> <comes after>" pairs. The pairing lives in
+  # awk rather than in a yq `as $s` binding because the yq form needs a literal
+  # $s inside single quotes, which shellcheck flags as SC2016 and
+  # writeShellApplication treats as a build failure.
   ordered=$(
-    {
-      yq -r '.services | keys[] | "__root__ " + .' "$rendered"
-      yq -r '.services | to_entries[] as $s
-             | ($s.value.depends_on // {} | keys[])
-             | . + " " + $s.key' "$rendered"
-    } | tsort 2>/dev/null | grep -vx '__root__' || true
+    yq -r '.services | to_entries[]
+           | .key + " " + ((.value.depends_on // {}) | keys | join(" "))' "$rendered" \
+    | awk '{ print "__root__ " $1; for (i = 2; i <= NF; i++) print $i " " $1 }' \
+    | tsort 2>/dev/null | grep -vx '__root__' || true
   )
   if [[ -z "$ordered" ]]; then
     echo "!! ${rendered}: could not order services by dependency (cycle?)," >&2

@@ -30,6 +30,7 @@
               coreutils
               gnused
               gnugrep
+              gawk # pairs up depends_on edges for tsort; not in coreutils
               jq
               # Go yq, NOT the python yq: the script relies on dot-path
               # access to hyphenated keys (.x-update) which python-yq's
