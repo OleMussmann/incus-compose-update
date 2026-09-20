@@ -30,6 +30,8 @@
 #   INCUS_POOL    storage pool (default: local)
 #   INCUS_PROJECT incus project (default: detected from rendered config)
 #   AUTO_PUSH     push each pin commit (default: 1; set 0 to commit only)
+#   REENSURE_TIMEOUT  dependency timeout for the post-recreate stack-wide up
+#                     (default: 2m)
 
 set -euo pipefail
 
@@ -50,6 +52,8 @@ config (environment):
   INCUS_POOL    storage pool (default: local)
   INCUS_PROJECT incus project (default: detected from rendered config)
   AUTO_PUSH     push each pin commit (default: 1; set 0 to commit only)
+  REENSURE_TIMEOUT  dependency timeout for the post-recreate stack-wide up
+                    (default: 2m)
 
 git:
   A run pulls each stack dir before reading its pins, refuses to apply when a
@@ -66,6 +70,10 @@ esac
 POOL="${INCUS_POOL:-local}"
 READY_TRIES="${READY_TRIES:-20}"
 READY_INTERVAL="${READY_INTERVAL:-3}"
+# Bound on the stack-wide re-ensure after each recreate. That walk is much
+# bigger than the service-scoped one and blocks on every service_healthy gate
+# in the stack, so it gets a shorter leash than incus-compose's own 5m default.
+REENSURE_TIMEOUT="${REENSURE_TIMEOUT:-2m}"
 
 # --- stack directory resolution ---
 
@@ -115,6 +123,40 @@ render_stack() {
 
 cleanup_render() {
   [[ -n "${RENDERED:-}" ]] && rm -f "$RENDERED"
+}
+
+# Service names in dependency order: every service after the ones it depends on.
+#
+# The plan used to follow `yq keys[]` — render order, which is alphabetical and
+# so carries no meaning as an ordering. On 2026-09-17 that put firecrawl ahead
+# of nuq-postgres, which firecrawl depends on: firecrawl was rebuilt on its new
+# pin, and then nuq-postgres's own `up --recreate` tore that fresh instance
+# straight back down again. Dependencies first means a dependent is rebuilt
+# after the thing it sits on, so it survives the run.
+#
+# This is churn control, not the guard — see the stack-wide re-ensure in
+# cmd_apply for why ordering alone cannot be enough.
+#
+# __root__ keeps services that have no edges in the output; tsort emits only
+# nodes that appear in some pair. A depends_on cycle makes tsort fail, and the
+# fallback is render order — a bad order beats skipping the stack entirely.
+services_in_dep_order() {
+  local rendered="$1" ordered=""
+  ordered=$(
+    {
+      yq -r '.services | keys[] | "__root__ " + .' "$rendered"
+      yq -r '.services | to_entries[] as $s
+             | ($s.value.depends_on // {} | keys[])
+             | . + " " + $s.key' "$rendered"
+    } | tsort 2>/dev/null | grep -vx '__root__' || true
+  )
+  if [[ -z "$ordered" ]]; then
+    echo "!! ${rendered}: could not order services by dependency (cycle?)," >&2
+    echo "   falling back to render order" >&2
+    yq -r '.services | keys[]' "$rendered"
+    return 0
+  fi
+  printf '%s\n' "$ordered"
 }
 
 # --- image reference parsing ---
@@ -469,6 +511,23 @@ preflight() {
   fi
 }
 
+# Every instance in a project, one name per line, sorted.
+#
+# Used to bracket a recreate. A service-scoped `up --recreate` deletes the
+# target's dependents in order to get at the target, and does not bring them
+# back; the stack-wide re-ensure in cmd_apply is what rebuilds them. Diffing
+# the set before against the set after is the check that does not rest on
+# understanding incus-compose's graph walk: whatever the cause, an instance
+# that was here and is not is a hole, and the run has to stop rather than
+# report success over it.
+#
+# Hit live 2026-09-17: updating nuq-postgres tore down firecrawl-1 and
+# nuq-init-1, apply verified only nuq-postgres and passed, and the stack ran
+# without firecrawl for three days before anyone noticed.
+instance_set() {
+  incus --project "$1" list --format csv -c n 2>/dev/null | sort || true
+}
+
 version_of() {
   local stack_dir="$1" service="$2"
   shift 2
@@ -749,6 +808,9 @@ cmd_apply() {
   echo "==> pinning ${cur} -> ${ref}"
   write_pin "$env_file" "$PIN_VAR" "$ref"
 
+  local instances_before
+  instances_before=$(instance_set "$project")
+
   # Recreate — both env files, pins last
   echo "==> pulling and recreating"
   incus_compose "$stack_dir" up -d --recreate --pull always "$service"
@@ -767,6 +829,40 @@ cmd_apply() {
   # swallowed output. A start that genuinely fails still surfaces, as the
   # readiness check below will not see the instance come back.
   incus_compose "$stack_dir" start "$service" >/dev/null 2>&1 || true
+
+  # Re-ensure the whole stack. The recreate above is service-scoped, so
+  # anything it tore down to reach its target — the target's dependents, and
+  # theirs in turn — is simply gone by this point. A plain `up -d` over every
+  # service rebuilds exactly those, and is a no-op for everything already
+  # running: no --recreate, so nothing healthy is deleted, and no --pull, so
+  # no sibling is dragged onto a newer image behind its own pin.
+  #
+  # This, not the plan ordering below, is what closes the hole. Ordering only
+  # helps when both services are in the same plan; a plan containing just the
+  # dependency still tears its dependents down, and no later step rebuilds
+  # them.
+  echo "==> re-ensuring stack"
+  if ! incus_compose "$stack_dir" up -d --dependency-timeout "$REENSURE_TIMEOUT"; then
+    echo "    !! re-ensure did not finish cleanly — see what is missing below"
+  fi
+
+  # Whatever the re-ensure managed, nothing may have vanished across the apply.
+  local instances_after vanished="" inst
+  instances_after=$(instance_set "$project")
+  while IFS= read -r inst; do
+    [[ -n "$inst" ]] || continue
+    grep -qxF "$inst" <<< "$instances_after" || vanished+="     ${inst}"$'\n'
+  done <<< "$instances_before"
+  if [[ -n "$vanished" ]]; then
+    echo
+    echo "!! instances that existed before this apply are gone after it:"
+    printf '%s' "$vanished"
+    echo "   Recreating ${service} tore them down and nothing rebuilt them, so"
+    echo "   the stack is incomplete. Stopping before anything else is touched."
+    echo "   inspect: incus --project ${project} list"
+    echo "   rebuild: ( cd ${stack_dir} && incus-compose --env-file .env --env-file versions.env up -d )"
+    return 1
+  fi
 
   # --- verify ---
   #
@@ -890,7 +986,9 @@ cmd_apply_all() {
     # that match the server, and cmd_apply's own git_sync_in is then a no-op.
     git_sync_in "$dir"
     render_stack "$dir"
-    services=$(yq -r '.services | keys[]' "$RENDERED")
+    # Dependency order, so a dependency is never applied after a dependent
+    # that its own recreate would tear back down.
+    services=$(services_in_dep_order "$RENDERED")
     for svc in $services; do
       yq -e ".services.\"${svc}\".x-update" "$RENDERED" >/dev/null 2>&1 || continue
       parse_x_update "$dir" "$svc" "$RENDERED"
