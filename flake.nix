@@ -44,6 +44,34 @@
             text = builtins.readFile ./bin/incus-compose-update;
           };
 
+          # The Go port (docs/go-port-plan.md). Becomes the default at cutover;
+          # until then it is installed explicitly.
+          incus-compose-update-go = pkgs.buildGoModule {
+            pname = "incus-compose-update";
+            version = "0.1.0";
+            src = self;
+            vendorHash = "sha256-lliVSewCk9SwUQhiqsXUhXvDd1d9ymDWKu9sSAyZJhI=";
+            subPackages = [ "cmd/incus-compose-update" ];
+            env.CGO_ENABLED = "0";
+            ldflags = [ "-s" "-w" ];
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            # gitsync's tests drive real repositories.
+            nativeCheckInputs = [ pkgs.git ];
+            # The default check phase tests only subPackages.
+            checkPhase = ''
+              runHook preCheck
+              go vet ./...
+              go test ./...
+              runHook postCheck
+            '';
+            # git and ssh for pulling and pushing stack checkouts; incus-compose
+            # itself is expected on PATH, as for the bash version.
+            postInstall = ''
+              wrapProgram $out/bin/incus-compose-update \
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.git pkgs.openssh ]}
+            '';
+          };
+
           default = self.packages.${system}.incus-compose-update;
         }
       );

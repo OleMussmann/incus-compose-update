@@ -1,7 +1,45 @@
 # Go port plan
 
-Status: proposed. Nothing ported yet; `bin/incus-compose-update` (bash) is the
-implementation of record until cutover.
+Status: phases 0–5 done on the `go-port` branch; cutover (6) and incident
+cleanup (7) remain. The bash `bin/incus-compose-update` is still the flake's
+default package; the Go binary is `.#incus-compose-update-go`.
+
+## Where it stands
+
+- **Parity.** `check` output is byte-identical to the bash on the live stacks
+  and on copies with stale pins (tag and digest modes, Docker Hub and ghcr.io,
+  `order: pushed`, multi-page tag lists, the "no pin — skipping" path). The
+  `apply-all` plan lists the same updates.
+- **Real applies** ran against a throwaway Incus project: a digest-mode
+  service with a volume and a tag-mode dependent, in dependency order, with
+  snapshot, pin, recreate, re-ensure, identity check, commit and push; then a
+  rollback by name. Snapshots were confirmed to ignore the volume's
+  `snapshots.expiry`, and the stale-checkout guard refused as designed.
+- **Tests** run in the Nix build (`go vet`, `go test ./...`), including real
+  git repositories and an in-memory registry with Link pagination. Mutating
+  the snapshot, identity and running→stopped checks each fails a test.
+- **Not yet exercised:** an apply on the production stacks — none was pending.
+
+## Deliberate differences from the bash
+
+- `order: pushed` is an error on registries without push order (all but
+  Docker Hub), instead of silently taking the lexically first tag.
+- `order: version` lists every tag on Docker Hub too (paginated registry API),
+  not only the 100 most recently updated.
+- `check` reports a failing service and carries on, then exits non-zero.
+- A missing registry repository is reported as "not found, or requires
+  authentication".
+- `tag_re` is Go RE2, validated when read, and required for `mode: tag`;
+  `mode` and `order` values are validated.
+- The "adopt what the server runs" suggestion keeps a digest's `sha256:`.
+- Appending a new pin to a `versions.env` without a trailing newline starts a
+  new line.
+- Independent services in `apply-all` are ordered by render order (the bash
+  used tsort's arbitrary order among them).
+- Incus is reached through its API, on `$INCUS_REMOTE` or the CLI's default
+  remote; the `incus` CLI is no longer a dependency. Registry requests use
+  Docker credentials from `~/.docker/config.json` when present.
+- New: `--dry-run` for `apply` and `apply-all`.
 
 ## Why
 
