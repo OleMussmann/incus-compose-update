@@ -15,6 +15,12 @@ inputs.incus-compose-update.url = "github:OleMussmann/incus-compose-update";
 
 Or directly: `nix run github:OleMussmann/incus-compose-update -- --help`
 
+`incus-compose` must be on `PATH`; the package brings its own `git` and `ssh`.
+Incus is reached through its API, using the incus CLI's configuration: the
+remote named by `$INCUS_REMOTE` (as incus-compose honours it), else the default
+remote. Registry requests use Docker credentials from `~/.docker/config.json`
+when present, and go anonymous otherwise.
+
 ## Commands
 
 ```
@@ -23,6 +29,15 @@ incus-compose-update check <service>        same, scoped to one service
 incus-compose-update apply <service> <ref>  snapshot, pin, recreate, re-ensure, verify
 incus-compose-update apply-all [--yes]      apply every pending update, one at a time
 ```
+
+No arguments means `check`. `check` reports a service it cannot check (an
+unreachable registry, a `tag_re` that matches nothing), carries on with the
+rest, and exits non-zero at the end.
+
+`apply` and `apply-all` take `--dry-run`: every read-only step runs — the
+registry lookup, the pin-versus-server check, the volume check — and the steps
+that would change something are printed instead of run. A dry run does not
+rebase the checkout; it only warns when it is behind.
 
 ### `apply-all`
 
@@ -47,11 +62,10 @@ rather than halfway through a run.
 
 **Ordered dependencies-first.** Within each stack the plan is sorted
 topologically on `depends_on`, so a service is never recreated before something
-it depends on. Render order — which is alphabetical, and what this used to
-follow — put `firecrawl` ahead of its own `nuq-postgres`, and recreating the
-dependency then tore the freshly-updated dependent back down. A `depends_on`
-cycle falls back to render order with a warning rather than skipping the
-stack.
+it depends on — recreating a dependency tears its dependents down, which would
+undo an update applied to them earlier in the run. Services with no ordering
+between them keep render order. A `depends_on` cycle falls back to render order
+with a warning rather than skipping the stack.
 
 `--yes` skips the prompt for unattended use. Without it, a non-interactive
 invocation refuses rather than assuming consent.
@@ -75,9 +89,8 @@ As a backstop that does not depend on incus-compose's graph semantics, `apply`
 brackets the recreate with the project's instance list and **fails if anything
 present before the apply is missing after it, or was running before and is
 stopped after it**, naming what was lost. Instances already stopped beforehand
-are ignored. Ordering
-alone cannot cover this: a plan containing only a dependency still tears its
-dependents down.
+are ignored. Ordering alone cannot cover this: a plan containing only a
+dependency still tears its dependents down.
 
 **Stops at the first failure.** The failed service prints its usual rollback
 instructions; remaining services are untouched and still on their current pins.
@@ -96,6 +109,9 @@ Environment variables:
 | `INCUS_PROJECT` | Incus project | detected from `compose.yaml` |
 | `AUTO_PUSH` | push each pin commit | `1` (set `0` to commit only) |
 | `REENSURE_TIMEOUT` | dependency timeout for the post-recreate stack-wide `up` | `2m` |
+| `READY_TRIES` | readiness probes after a recreate | `20` |
+| `READY_INTERVAL` | seconds between readiness probes | `3` |
+| `INCUS_REMOTE` | Incus remote | the incus CLI's default remote |
 
 ## The `x-update:` schema
 
@@ -119,7 +135,7 @@ services:
 | Key | Values | Default | Meaning |
 |---|---|---|---|
 | `mode` | `tag` \| `digest` | `tag` | Pin a tag, or a digest of the tag in `image:` |
-| `tag_re` | ERE string | — | Required for `mode: tag`; filters upstream tags |
+| `tag_re` | regular expression ([RE2](https://github.com/google/re2/wiki/Syntax)) | — | Required for `mode: tag`; filters upstream tags |
 | `order` | `version` \| `pushed` | `version` | How to pick newest among matches |
 | `volume` | volume name \| `none` | `none` | Volume to snapshot before recreate |
 | `version_cmd` | argv list | `[<service>, --version]` | How to ask the running instance its version |
@@ -132,7 +148,10 @@ services:
 ### Modes
 
 **Tag mode** (`mode: tag`): filters upstream tags by `tag_re`, selects newest
-by version sort or push order, pins the tag string.
+by version sort or push order, pins the tag string. Version sort orders tags
+as GNU `sort -V` does. Push order needs a registry that reports it: the OCI
+distribution API lists tag names only, so `order: pushed` works on Docker Hub
+(through its own API) and is refused elsewhere — use `mode: digest` there.
 
 **Digest mode** (`mode: digest`): fetches the digest of **the tag named in
 `image:`**, pins the digest string. Use for images that publish no useful
@@ -206,16 +225,22 @@ side is right:
 
 ## Safety
 
-- **Backwards guard**: errors if computed newest is older than current pin
-- **Snapshot before recreate**: configurable per-service via `volume`
+- **Backwards guard**: errors if computed newest is older than current pin.
+  For `order: pushed`, only the part before the first `-` is compared: tags
+  like `2026.8.28-a30b2d474` carry an opaque build suffix that version sort
+  would read as a number
+- **Snapshot before recreate**: configurable per-service via `volume`. The
+  snapshot never expires, whatever the volume's `snapshots.expiry`, so a
+  rollback point outlives scheduled snapshot retention. Its name is
+  `pre-<ref>-<YYYYmmddHHMM>`, with a digest shortened to `sha256-<12 hex>` to
+  stay within Incus's 64-character limit. If the snapshot fails, nothing is
+  changed
 - **Verify after recreate**: checks the instance's own record of the image it
   was built from (`image.id` / `user.image_alias`) against the new pin, then
   that the container answers `version_cmd` at all. Image identity is the fact
   that settles whether the recreate took; the version string is only a
   liveness probe, and is allowed to be unchanged — two rebuilds of a
-  digest-pinned base image report the same release (`debian:13-slim` is
-  `13.6` before and after), which the old before/after comparison mistook for
-  a failed update, and then mistook again on the rollback it suggested
+  digest-pinned base image can report the same release
 - **Pull before, push after**: see [Several checkouts, one
   server](#several-checkouts-one-server)
 - **Refuses to apply from a stale checkout**: if the pin being moved is not
@@ -228,8 +253,30 @@ side is right:
   aborts the whole run if any of them cannot be resolved
 - **Confirm before recreate**: `apply-all` prompts once, and refuses to run
   non-interactively unless given `--yes`
-- **Start after recreate**: a service-scoped `up` under incus-compose 1.2.0 can
-  build the instance correctly and still leave it stopped, because its
-  "Starting resources" phase bails on any resource the run did not ensure —
-  including sibling services' images. `apply` follows every recreate with a
-  `start`, which is a no-op when the service is already running
+- **Start after recreate**: a service-scoped `up` can build the instance
+  correctly and still leave it stopped, because its "Starting resources" phase
+  bails on any resource the run did not ensure — including sibling services'
+  images. `apply` follows every recreate with a `start`, which is a no-op when
+  the service is already running
+- **Shared service names**: a service name only identifies a service within
+  one stack. `apply <service>` uses the stack in which that service has an
+  `x-update:` block, and refuses a name managed in more than one stack
+  (narrow `STACK_DIRS` to pick one)
+
+## Development
+
+```
+cmd/incus-compose-update/  flags, environment, dispatch
+internal/stack/            rendered config, x-update:, pin variable, dependency order
+internal/imageref/         image reference parsing
+internal/version/          sort -V ordering, newest-tag selection, backwards guard
+internal/pins/             versions.env read/write
+internal/registry/         tags and digests (go-containerregistry, Docker Hub API)
+internal/incus/            instances, volumes, snapshots (Incus client library)
+internal/compose/          incus-compose invocations
+internal/gitsync/          pull, commit, push
+internal/apply/            check, apply, apply-all
+```
+
+`nix build` runs `go vet` and `go test ./...`. Locally:
+`nix shell nixpkgs#go --command sh -c 'CGO_ENABLED=0 go test ./...'`.

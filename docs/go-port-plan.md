@@ -1,8 +1,8 @@
 # Go port plan
 
-Status: phases 0–5 done on the `go-port` branch; cutover (6) and incident
-cleanup (7) remain. The bash `bin/incus-compose-update` is still the flake's
-default package; the Go binary is `.#incus-compose-update-go`.
+Status: phases 0–6 done — the Go binary is the flake's package and the bash
+script is removed, with no legacy package (roll back through git if needed).
+Phase 7 remains for the stack repos.
 
 ## Where it stands
 
@@ -222,10 +222,9 @@ From the README's safety list and the script's comments:
    (useful permanently). First real apply on one low-risk, volume-less
    service; then one with a volume and a digest pin, to exercise the snapshot.
 5. **`apply-all`.** Planner, confirmation, stop-at-first-failure.
-6. **Cutover.** Flake's default package becomes the Go binary; bash kept as
-   `incus-compose-update-legacy` for one release; README updated; then the
-   bash and its runtime inputs (yq-go, jq, gawk, curl, gnused, gnugrep) are
-   deleted.
+6. **Cutover.** Flake's default package becomes the Go binary; README
+   updated; the bash and its runtime inputs (yq-go, jq, gawk, curl, gnused,
+   gnugrep) are deleted. No legacy package: git history is the rollback.
 7. **Strip incident history.** Code comments, READMEs and docs state facts
    and reasons, not past incidents ("hit live on …", "this used to …");
    incidents belong in the vault. The Go code is written that way from the

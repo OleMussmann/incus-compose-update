@@ -22,31 +22,7 @@
           pkgs = nixpkgs.legacyPackages.${system};
         in
         {
-          incus-compose-update = pkgs.writeShellApplication {
-            name = "incus-compose-update";
-            runtimeInputs = with pkgs; [
-              git
-              openssh # push over ssh remotes; not on PATH in a systemd unit
-              coreutils
-              gnused
-              gnugrep
-              gawk # pairs up depends_on edges for tsort; not in coreutils
-              jq
-              # Go yq, NOT the python yq: the script relies on dot-path
-              # access to hyphenated keys (.x-update) which python-yq's
-              # jq backend parses as subtraction (x - update()) and errors
-              # on. Hit live 2026-08-05 — built fine, silently listed zero
-              # services. yq-go is v4.
-              yq-go
-              curl
-              incus
-            ];
-            text = builtins.readFile ./bin/incus-compose-update;
-          };
-
-          # The Go port (docs/go-port-plan.md). Becomes the default at cutover;
-          # until then it is installed explicitly.
-          incus-compose-update-go = pkgs.buildGoModule {
+          incus-compose-update = pkgs.buildGoModule {
             pname = "incus-compose-update";
             version = "0.1.0";
             src = self;
@@ -65,7 +41,7 @@
               runHook postCheck
             '';
             # git and ssh for pulling and pushing stack checkouts; incus-compose
-            # itself is expected on PATH, as for the bash version.
+            # itself is expected on PATH.
             postInstall = ''
               wrapProgram $out/bin/incus-compose-update \
                 --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.git pkgs.openssh ]}
