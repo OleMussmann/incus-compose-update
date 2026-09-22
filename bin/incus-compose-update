@@ -357,6 +357,25 @@ current_pin() {
   grep -E "^${2}=" "$1" 2>/dev/null | head -1 | cut -d= -f2- || true
 }
 
+# Name for the pre-apply volume snapshot: pre-<ref>-<YYYYmmddHHMM>.
+#
+# Incus caps snapshot names at 64 characters, and a digest ref alone is 71
+# (sha256:<64 hex>). A digest is shortened to its algorithm and first 12 hex
+# digits, which is how registries abbreviate it too; anything else outside
+# [A-Za-z0-9._-] becomes '-', and a long tag is truncated to fit.
+snapshot_name() {
+  local ref="$1" stamp label
+  stamp=$(date +%Y%m%d%H%M)
+  if [[ "$ref" =~ ^([a-z0-9]+):([0-9a-f]{12})[0-9a-f]*$ ]]; then
+    label="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
+  else
+    label="${ref//[^A-Za-z0-9._-]/-}"
+  fi
+  # 64 - "pre-" - "-" - stamp
+  label="${label:0:$((64 - 5 - ${#stamp}))}"
+  echo "pre-${label}-${stamp}"
+}
+
 write_pin() {
   local env_file="$1" pin_var="$2" value="$3"
   if grep -qE "^${pin_var}=" "$env_file" 2>/dev/null; then
@@ -528,8 +547,13 @@ preflight() {
 # Hit live 2026-09-17: updating nuq-postgres tore down firecrawl-1 and
 # nuq-init-1, apply verified only nuq-postgres and passed, and the stack ran
 # without firecrawl for three days before anyone noticed.
+#
+# Existing is not enough, though: an instance can survive the apply and still
+# be down — a re-ensure whose "Starting resources" phase aborts leaves stopped
+# instances stopped. So the snapshot carries each instance's state too —
+# "<name>,<STATE>" per line.
 instance_set() {
-  incus --project "$1" list --format csv -c n 2>/dev/null | sort || true
+  incus --project "$1" list --format csv -c ns 2>/dev/null | sort || true
 }
 
 version_of() {
@@ -674,24 +698,47 @@ cmd_check_one() {
   echo
 }
 
+# Stack dirs in which a service is defined AND carries an x-update: block.
+# Sets the global MANAGED_DIRS array; dies if no stack manages the service.
+#
+# Service names are only unique per stack: two stacks may both define `redis`
+# with only one of them managing it. The first stack that merely *defines* the
+# name is therefore the wrong answer; only managing stacks count.
+MANAGED_DIRS=()
+stacks_managing() {
+  local service="$1" dir unmanaged=()
+  MANAGED_DIRS=()
+  while IFS= read -r dir; do
+    [[ -f "$dir/compose.yaml" ]] || continue
+    render_stack "$dir"
+    if yq -e ".services.\"${service}\".x-update" "$RENDERED" >/dev/null 2>&1; then
+      MANAGED_DIRS+=("$dir")
+    elif yq -e ".services.\"${service}\"" "$RENDERED" >/dev/null 2>&1; then
+      unmanaged+=("$dir")
+    fi
+    cleanup_render
+  done < <(resolve_stack_dirs)
+  if [[ ${#MANAGED_DIRS[@]} -eq 0 ]]; then
+    [[ ${#unmanaged[@]} -gt 0 ]] \
+      && die "service '${service}' has no x-update: block (in ${unmanaged[*]})"
+    die "service '${service}' not found in any stack dir"
+  fi
+}
+
 cmd_check() {
   local service="${1:-}"
 
   if [[ -n "$service" ]]; then
-    local found=0
-    while IFS= read -r dir; do
-      [[ -f "$dir/compose.yaml" ]] || continue
+    # Read-only, so an ambiguous name just checks every stack that manages it.
+    local dir
+    stacks_managing "$service"
+    for dir in "${MANAGED_DIRS[@]}"; do
+      [[ ${#MANAGED_DIRS[@]} -gt 1 ]] && echo "== stack: ${dir}"
       render_stack "$dir"
-      if yq -e ".services.\"${service}\"" "$RENDERED" >/dev/null 2>&1; then
-        git_warn_if_stale "$dir"
-        cmd_check_one "$dir" "$service"
-        found=1
-        cleanup_render
-        break
-      fi
+      git_warn_if_stale "$dir"
+      cmd_check_one "$dir" "$service"
       cleanup_render
-    done < <(resolve_stack_dirs)
-    [[ $found -eq 1 ]] || die "service '${service}' not found in any stack dir"
+    done
   else
     # NOTE: not isolated per stack — resolve_latest dies on an unreachable
     # registry or a stale tag_re, and die exits, so the stacks after it are
@@ -713,26 +760,21 @@ cmd_check() {
 }
 
 cmd_apply() {
-  local service="${1:-}" ref="${2:-}"
+  # stack_dir is internal: apply-all already knows which stack it planned the
+  # service in, and must not have that re-guessed from the name.
+  local service="${1:-}" ref="${2:-}" stack_dir="${3:-}"
   [[ -n "$service" && -n "$ref" ]] || die "usage: incus-compose-update apply <service> <ref>"
 
-  # Find stack dir containing this service
-  local stack_dir=""
-  while IFS= read -r dir; do
-    [[ -f "$dir/compose.yaml" ]] || continue
-    render_stack "$dir"
-    if yq -e ".services.\"${service}\"" "$RENDERED" >/dev/null 2>&1; then
-      stack_dir="$dir"
-      break
+  if [[ -z "$stack_dir" ]]; then
+    stacks_managing "$service"
+    if [[ ${#MANAGED_DIRS[@]} -gt 1 ]]; then
+      die "service '${service}' is managed in several stacks (${MANAGED_DIRS[*]}) — pick one with STACK_DIRS=<dir>"
     fi
-    cleanup_render
-  done < <(resolve_stack_dirs)
-  [[ -n "$stack_dir" ]] || die "service '${service}' not found in any stack dir"
+    stack_dir="${MANAGED_DIRS[0]}"
+  fi
 
-  # The render above only had to locate the service. Freshen the checkout now,
-  # before any pin is read, and render again: a pull moves versions.env, and
-  # every pin below has to come from the post-pull tree.
-  cleanup_render
+  # Freshen the checkout before any pin is read, then render: a pull moves
+  # versions.env, and every pin below has to come from the post-pull tree.
   git_sync_in "$stack_dir"
   render_stack "$stack_dir"
 
@@ -796,28 +838,46 @@ cmd_apply() {
   local before
   before=$(version_of "$stack_dir" "$service" "${VERSION_CMD[@]}")
 
+  # Every step from here on checks its own status. set -e does NOT apply in
+  # this function: bash suspends errexit for the whole body of a function
+  # called as an `if !` or `||` operand, and both callers (apply-all's
+  # `if ! cmd_apply` and the dispatcher's `cmd_apply || exit 1`) do exactly
+  # that. Without explicit checks, a rejected snapshot would be stepped over
+  # and the service recreated with no rollback point.
+
   # Snapshot
   local snap=""
   if [[ "$VOLUME" != "none" ]]; then
-    snap="pre-${ref}-$(date +%Y%m%d%H%M)"
+    snap=$(snapshot_name "$ref")
     echo "==> snapshotting ${project}:${POOL}/${VOLUME} as ${snap}"
     # --no-expiry: a rollback point has to outlive the volume's own retention.
     # Without it the server fills the expiry from snapshots.expiry.manual,
     # falling back to snapshots.expiry, so a volume on a daily schedule would
     # prune its pre-upgrade snapshots along with the scheduled ones.
-    incus --project "$project" storage volume snapshot create --no-expiry "$POOL" "$VOLUME" "$snap"
+    if ! incus --project "$project" storage volume snapshot create --no-expiry "$POOL" "$VOLUME" "$snap"; then
+      echo "!! could not snapshot ${VOLUME} — nothing was changed"
+      return 1
+    fi
   fi
 
   # Pin
   echo "==> pinning ${cur} -> ${ref}"
-  write_pin "$env_file" "$PIN_VAR" "$ref"
+  if ! write_pin "$env_file" "$PIN_VAR" "$ref"; then
+    echo "!! could not write ${PIN_VAR} to ${env_file}"
+    return 1
+  fi
 
   local instances_before
   instances_before=$(instance_set "$project")
 
   # Recreate — both env files, pins last
   echo "==> pulling and recreating"
-  incus_compose "$stack_dir" up -d --recreate --pull always "$service"
+  # A failure here is reported, not returned on: the instance may be half
+  # rebuilt, and the re-ensure, vanished-instance check and image-identity
+  # verify below are what can tell the difference — and print the rollback.
+  if ! incus_compose "$stack_dir" up -d --recreate --pull always "$service"; then
+    echo "    !! recreate exited non-zero — continuing to verify"
+  fi
 
   # A service-scoped `up` under incus-compose 1.2.0 can create the instance
   # correctly and then leave it STOPPED: its "Starting resources" phase walks
@@ -850,19 +910,33 @@ cmd_apply() {
     echo "    !! re-ensure did not finish cleanly — see what is missing below"
   fi
 
-  # Whatever the re-ensure managed, nothing may have vanished across the apply.
-  local instances_after vanished="" inst
+  # Whatever the re-ensure managed, nothing may have vanished across the apply,
+  # and nothing that was running before may be down after it. Instances that
+  # were already stopped beforehand are not this apply's doing and are ignored.
+  local instances_after vanished="" stopped="" inst state state_after
   instances_after=$(instance_set "$project")
-  while IFS= read -r inst; do
+  while IFS=, read -r inst state; do
     [[ -n "$inst" ]] || continue
-    grep -qxF "$inst" <<< "$instances_after" || vanished+="     ${inst}"$'\n'
+    state_after=$(grep -m1 "^${inst}," <<< "$instances_after" | cut -d, -f2 || true)
+    if [[ -z "$state_after" ]]; then
+      vanished+="     ${inst}"$'\n'
+    elif [[ "$state" == "RUNNING" && "$state_after" != "RUNNING" ]]; then
+      stopped+="     ${inst} (${state_after})"$'\n'
+    fi
   done <<< "$instances_before"
-  if [[ -n "$vanished" ]]; then
+  if [[ -n "$vanished" || -n "$stopped" ]]; then
     echo
-    echo "!! instances that existed before this apply are gone after it:"
-    printf '%s' "$vanished"
-    echo "   Recreating ${service} tore them down and nothing rebuilt them, so"
-    echo "   the stack is incomplete. Stopping before anything else is touched."
+    if [[ -n "$vanished" ]]; then
+      echo "!! instances that existed before this apply are gone after it:"
+      printf '%s' "$vanished"
+    fi
+    if [[ -n "$stopped" ]]; then
+      echo "!! instances that were running before this apply are down after it:"
+      printf '%s' "$stopped"
+    fi
+    echo "   Recreating ${service} left them that way and the re-ensure did not"
+    echo "   recover them, so the stack is incomplete. Stopping before anything"
+    echo "   else is touched — the re-ensure output above says why."
     echo "   inspect: incus --project ${project} list"
     echo "   rebuild: ( cd ${stack_dir} && incus-compose --env-file .env --env-file versions.env up -d )"
     return 1
@@ -1050,7 +1124,7 @@ cmd_apply_all() {
     echo "=================================================================="
     echo "[$((n + 1))/${total}] ${svc}: ${cur} -> ${new}"
     echo "=================================================================="
-    if ! cmd_apply "$svc" "$new"; then
+    if ! cmd_apply "$svc" "$new" "$dir"; then
       echo
       echo "!! stopped at ${svc} — ${n} of ${total} applied"
       echo "   the remaining $((total - n - 1)) service(s) are untouched and still"

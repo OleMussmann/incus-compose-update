@@ -73,7 +73,9 @@ in the stack.
 
 As a backstop that does not depend on incus-compose's graph semantics, `apply`
 brackets the recreate with the project's instance list and **fails if anything
-present before the apply is missing after it**, naming what was lost. Ordering
+present before the apply is missing after it, or was running before and is
+stopped after it**, naming what was lost. Instances already stopped beforehand
+are ignored. Ordering
 alone cannot cover this: a plan containing only a dependency still tears its
 dependents down.
 
