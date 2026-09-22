@@ -20,7 +20,7 @@ Or directly: `nix run github:OleMussmann/incus-compose-update -- --help`
 ```
 incus-compose-update check                  compare pinned tags against upstream, all services
 incus-compose-update check <service>        same, scoped to one service
-incus-compose-update apply <service> <ref>  snapshot, pin, recreate, verify
+incus-compose-update apply <service> <ref>  snapshot, pin, recreate, re-ensure, verify
 incus-compose-update apply-all [--yes]      apply every pending update, one at a time
 ```
 
@@ -45,6 +45,14 @@ Every target ref is resolved *before* anything is mutated, so an unreachable
 registry or a stale `tag_re` fails with all stacks still on their current pins,
 rather than halfway through a run.
 
+**Ordered dependencies-first.** Within each stack the plan is sorted
+topologically on `depends_on`, so a service is never recreated before something
+it depends on. Render order — which is alphabetical, and what this used to
+follow — put `firecrawl` ahead of its own `nuq-postgres`, and recreating the
+dependency then tore the freshly-updated dependent back down. A `depends_on`
+cycle falls back to render order with a warning rather than skipping the
+stack.
+
 `--yes` skips the prompt for unattended use. Without it, a non-interactive
 invocation refuses rather than assuming consent.
 
@@ -53,6 +61,21 @@ that `apply` rewrites in place and commits, `up --recreate` starts linked
 services (no `--no-deps`), and verification exec's into the container — all
 three break under concurrency, while incus-compose already funnels image pulls
 through one lock. Serial also means a failure has exactly one suspect.
+
+**Every service is re-ensured, and nothing may disappear.** A service-scoped
+`up --recreate` deletes the target's *dependents* in order to rebuild the
+target, and does not bring them back — `up <svc>` ensures a service's
+dependencies, never its dependents. So each `apply` follows its recreate with a
+plain stack-wide `up -d` (no `--recreate`, no `--pull`), which rebuilds exactly
+what was torn down and is a no-op for anything already running. It is bounded
+by `REENSURE_TIMEOUT`, since that walk blocks on every `service_healthy` gate
+in the stack.
+
+As a backstop that does not depend on incus-compose's graph semantics, `apply`
+brackets the recreate with the project's instance list and **fails if anything
+present before the apply is missing after it**, naming what was lost. Ordering
+alone cannot cover this: a plan containing only a dependency still tears its
+dependents down.
 
 **Stops at the first failure.** The failed service prints its usual rollback
 instructions; remaining services are untouched and still on their current pins.
@@ -70,6 +93,7 @@ Environment variables:
 | `INCUS_POOL` | storage pool | `local` |
 | `INCUS_PROJECT` | Incus project | detected from `compose.yaml` |
 | `AUTO_PUSH` | push each pin commit | `1` (set `0` to commit only) |
+| `REENSURE_TIMEOUT` | dependency timeout for the post-recreate stack-wide `up` | `2m` |
 
 ## The `x-update:` schema
 
