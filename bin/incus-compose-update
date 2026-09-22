@@ -1066,7 +1066,11 @@ cmd_apply_all() {
 
 # --- main ---
 
-case "${1:-check}" in
+# No arguments means check. Set it here rather than via ${1:-check}, so the
+# branch's shift has something to shift: a bare shift fails under set -e.
+(( $# )) || set -- check
+
+case "$1" in
   check)      shift; cmd_check "${1:-}" ;;
   apply)      shift; cmd_apply "${1:-}" "${2:-}" || exit 1 ;;
   apply-all)
