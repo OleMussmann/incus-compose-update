@@ -153,6 +153,18 @@ as GNU `sort -V` does. Push order needs a registry that reports it: the OCI
 distribution API lists tag names only, so `order: pushed` works on Docker Hub
 (through its own API) and is refused elsewhere — use `mode: digest` there.
 
+**Tag scheme changes.** When upstream changes its tag scheme, `tag_re` may
+still match the old scheme's tags, so the newest match goes stale while still
+looking current. On Docker Hub, `check` and `apply-all` therefore look at the
+tags pushed since the newest match. If any has a release shape (an optional
+`v`, then three or more dot-separated numbers) and `tag_re` rejects it, they
+warn and name it. Floating aliases (`2.1`, `latest`) and suffixed tags (`-rc.1`,
+`-alpine`) are ignored. The warning never fails the run, and on other
+registries, which report no push order, the check is skipped. After you fix
+`tag_re`, the downgrade guard usually refuses the new scheme's tags as "older"
+(`v0.22.6` sorts below `v2026.9.24`), so move the pin once with an explicit
+`apply <service> <ref>`, which skips the guard.
+
 **Digest mode** (`mode: digest`): fetches the digest of **the tag named in
 `image:`**, pins the digest string. Use for images that publish no useful
 versioned tags, or a rolling tag you want held still. The image reference

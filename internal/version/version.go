@@ -69,6 +69,33 @@ func Guard(cur, next, order string) error {
 	return nil
 }
 
+// releaseShape is what a plain release tag looks like in any common scheme:
+// an optional 'v' and at least three dot-separated numbers (1.2.3, v0.22.6,
+// 2026.9.24, v2026.7.7.2). Floating aliases (2, 2.1, latest) and anything
+// suffixed (rc.1, -desktop, -alpine, -a30b2d474) do not have it.
+var releaseShape = regexp.MustCompile(`^v?[0-9]+(\.[0-9]+){2,}$`)
+
+// Drift returns the release-shaped tags that re rejects among those pushed
+// after the newest tag it accepts. pushed must be newest-first; the scan
+// stops at the first tag re matches.
+//
+// A non-empty result means upstream publishes releases that tag_re no longer
+// sees. tag_re matching nothing at all is caught elsewhere; this is the
+// quieter case where the old scheme's tags still match, so the newest match
+// is stale yet looks current.
+func Drift(pushed []string, re *regexp.Regexp) []string {
+	var out []string
+	for _, t := range pushed {
+		if re.MatchString(t) {
+			break
+		}
+		if releaseShape.MatchString(t) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 // --- gnulib filevercmp, ported ---
 
 func isDigit(c byte) bool { return '0' <= c && c <= '9' }

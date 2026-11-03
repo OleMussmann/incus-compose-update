@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/OleMussmann/incus-compose-update/internal/compose"
@@ -205,5 +206,39 @@ func (a *App) latest(ctx context.Context, t *target, cur string) (string, error)
 	if err := version.Guard(cur, next, u.Order); err != nil {
 		return "", err
 	}
+	a.warnDrift(ctx, t, tags)
 	return next, nil
+}
+
+// warnDrift warns when upstream has pushed release-shaped tags that tag_re
+// rejects since the newest tag it accepts: the sign of a tag scheme change
+// that the old scheme's still-matching tags would otherwise hide. It needs
+// push order, so it runs only where the registry reports it (Docker Hub) and
+// is silent elsewhere. It never fails the lookup, since the heuristic can be
+// wrong and an API hiccup should not block an update.
+func (a *App) warnDrift(ctx context.Context, t *target, tags []string) {
+	u, ref := t.update, t.ref
+	pushed := tags
+	if u.Order != version.OrderPushed {
+		var err error
+		pushed, err = a.Registry.PushedTags(ctx, ref.Host, ref.Repo, u.TagRE.MatchString)
+		if errors.Is(err, registry.ErrNoPushOrder) {
+			return
+		}
+		if err != nil {
+			a.warn("!! %s: could not check for a tag scheme change: %v", t.service, err)
+			return
+		}
+	}
+	drift := version.Drift(pushed, u.TagRE)
+	if len(drift) == 0 {
+		return
+	}
+	shown := drift
+	if len(shown) > 5 {
+		shown = shown[:5]
+	}
+	a.warn("!! %s: %d release-shaped tag(s) pushed since the newest tag_re match are rejected by tag_re: %s",
+		t.service, len(drift), strings.Join(shown, " "))
+	a.warn("!! %s: upstream may have changed its tag scheme — review tag_re in compose.yaml", t.service)
 }

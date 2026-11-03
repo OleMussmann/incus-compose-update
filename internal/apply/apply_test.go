@@ -210,13 +210,19 @@ func (f *fakeGit) SyncOut(string) { f.pushed++ }
 type fakeRegistry struct {
 	digests map[string]string
 	tags    map[string][]string
-	err     error
+	// pushed holds newest-first tag lists for repos that report push order;
+	// a repo absent from it behaves like a registry without push order.
+	pushed map[string][]string
+	err    error
 }
 
 func (f *fakeRegistry) Tags(_ context.Context, _, repo string) ([]string, error) {
 	return f.tags[repo], f.err
 }
-func (f *fakeRegistry) PushedTags(context.Context, string, string, func(string) bool) ([]string, error) {
+func (f *fakeRegistry) PushedTags(_ context.Context, _, repo string, _ func(string) bool) ([]string, error) {
+	if tags, ok := f.pushed[repo]; ok {
+		return tags, nil
+	}
 	return nil, registry.ErrNoPushOrder
 }
 func (f *fakeRegistry) Digest(_ context.Context, _, repo, tag string) (string, error) {
@@ -517,6 +523,28 @@ func TestCheckOneService(t *testing.T) {
 	h.wantOutput("== db\ncurrent: " + oldDigest + "\nlatest:  " + newDigest + "\napply:     incus-compose-update apply db " + newDigest)
 	if strings.Contains(h.out.String(), "== app") {
 		t.Error("checked more than the named service")
+	}
+}
+
+func TestCheckWarnsOnTagSchemeChange(t *testing.T) {
+	h := newHarness(t)
+	h.reg.tags["acme/app"] = []string{"1.0.0", "v0.22.6", "v0.22.5"}
+	h.reg.pushed = map[string][]string{"acme/app": {"latest", "v0.22.6", "v0.22.6-desktop", "v0.22.5", "1.0.0"}}
+	if err := h.app.Check(context.Background(), "app"); err != nil {
+		t.Fatalf("%v\n%s", err, h.out)
+	}
+	h.wantOutput("up to date",
+		"!! app: 2 release-shaped tag(s) pushed since the newest tag_re match are rejected by tag_re: v0.22.6 v0.22.5",
+		"upstream may have changed its tag scheme")
+}
+
+func TestCheckNoDriftWarningWithoutPushOrder(t *testing.T) {
+	h := newHarness(t)
+	if err := h.app.Check(context.Background(), ""); err != nil {
+		t.Fatalf("%v\n%s", err, h.out)
+	}
+	if strings.Contains(h.out.String(), "tag scheme") {
+		t.Errorf("unexpected drift warning:\n%s", h.out)
 	}
 }
 

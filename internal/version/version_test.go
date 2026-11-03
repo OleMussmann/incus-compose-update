@@ -82,6 +82,39 @@ func TestNewest(t *testing.T) {
 	}
 }
 
+func TestDrift(t *testing.T) {
+	calver := regexp.MustCompile(`^v[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}(\.[0-9]+)?$`)
+	semver := regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
+	cases := []struct {
+		name   string
+		re     *regexp.Regexp
+		pushed []string
+		want   []string
+	}{
+		{
+			// Upstream moved from CalVer to semver; old CalVer tags still match.
+			"scheme change", calver,
+			[]string{"main", "latest", "v0.22.6", "v0.22.6-desktop", "rc.3-v0.22.6", "v0.22.5", "v2026.9.24", "v0.1.0"},
+			[]string{"v0.22.6", "v0.22.5"},
+		},
+		{
+			// Floating aliases and rc tags ahead of the newest release are normal.
+			"aliases and prereleases", semver,
+			[]string{"edge", "2.1", "2", "latest", "2.1.8-rc.1", "rc", "2.1.7", "2.1.6"},
+			nil,
+		},
+		{"newest push matches", semver, []string{"2.1.7", "v9.9.9"}, nil},
+		{"nothing matches", semver, []string{"v1.2.3", "latest"}, []string{"v1.2.3"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := Drift(c.pushed, c.re); !slices.Equal(got, c.want) {
+				t.Errorf("Drift = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
 func TestGuard(t *testing.T) {
 	cases := []struct {
 		cur, next, order string
