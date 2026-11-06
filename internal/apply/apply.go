@@ -49,15 +49,33 @@ func (a *App) Apply(ctx context.Context, service, ref, dir string) error {
 	if cur == "" {
 		return fmt.Errorf("no %s in %s", t.pinVar, t.envFile)
 	}
+	instance := service + "-1"
+
+	// versions.env is the record, not the server: an apply that pinned and
+	// then failed or was cut short leaves it ahead of the instance. "Already
+	// on" therefore has to be confirmed against what actually runs.
 	if cur == ref {
-		a.say("already on %s", ref)
-		return nil
+		id := a.identity(t, instance, ref)
+		if id.status != mismatch {
+			a.say("already on %s", ref)
+			return nil
+		}
+		from := imageref.PinOf(id.gotAlias)
+		if from == "" {
+			a.say("!! versions.env already pins %s at %s, but %s runs:", service, ref, instance)
+			a.say("     %s", id.got())
+			a.say("   and records no image alias to read its current pin from.")
+			a.say("   inspect: incus --project %s config show %s", t.project, instance)
+			return ErrReported
+		}
+		a.say("==> note: versions.env already pins %s, but %s still runs %s.", ref, instance, from)
+		a.say("    An earlier apply did not finish; applying from %s.", from)
+		cur = from
 	}
 
 	if err := a.preflight(t); err != nil {
 		return err
 	}
-	instance := service + "-1"
 
 	// Is the pin about to move the one actually running? If not, this
 	// checkout does not describe the server: the commit would record a "from"
@@ -128,10 +146,26 @@ func (a *App) Apply(ctx context.Context, service, ref, dir string) error {
 	}
 
 	a.say("==> pulling and recreating")
-	// A failure here is reported, not returned on: the instance may be half
+	// A failure here is not returned on directly: the instance may be half
 	// rebuilt, and the checks below are what can tell — and print the rollback.
-	if err := a.Compose.Recreate(dir, service); err != nil {
-		a.say("    !! recreate exited non-zero — continuing to verify")
+	// The one case settled here is a recreate that failed before replacing
+	// anything (a failed pull aborts it ahead of the delete): the pin goes
+	// back, so the record matches the server and a re-run is not mistaken for
+	// "already on". The re-ensure below still runs, on the restored pin, to
+	// bring back any dependents the recreate removed.
+	recreateErr := a.Compose.Recreate(dir, service)
+	untouched := false
+	if recreateErr != nil {
+		if a.identity(t, instance, cur).status == match {
+			untouched = true
+			a.say("    !! recreate exited non-zero and %s still runs %s — restoring the pin", instance, cur)
+			if err := pins.Write(t.envFile, t.pinVar, cur); err != nil {
+				a.say("!! could not restore %s to %s in %s", t.pinVar, cur, t.envFile)
+				return err
+			}
+		} else {
+			a.say("    !! recreate exited non-zero — continuing to verify")
+		}
 	}
 
 	// A service-scoped `up` can create the instance and leave it stopped: its
@@ -191,6 +225,18 @@ func (a *App) Apply(ctx context.Context, service, ref, dir string) error {
 		return ErrReported
 	}
 
+	if untouched {
+		a.say("")
+		a.say("!! recreating %s failed — the incus-compose output above says why", service)
+		a.say("   %s was not replaced and still runs %s, and %s is back on it.", instance, cur, t.pinVar)
+		a.say("   Nothing needs rolling back. Once the cause is fixed, re-run:")
+		a.say("     incus-compose-update apply %s %s", service, ref)
+		if snap != "" {
+			a.say("   the snapshot %s of %s is kept.", snap, t.update.Volume)
+		}
+		return ErrReported
+	}
+
 	// Two independent facts, checked separately because neither implies the
 	// other: the instance was rebuilt on the new ref, and it came back up.
 	// Image identity settles the first; the version probe only shows the
@@ -229,11 +275,16 @@ func (a *App) Apply(ctx context.Context, service, ref, dir string) error {
 		rollback()
 		return ErrReported
 	case mismatch:
+		want, got := id.pair()
 		a.say("")
 		a.say("!! %s is not running the new image", instance)
-		a.say("   wanted: %s", id.wantID)
-		a.say("   got:    %s", id.gotOrID())
-		a.say("   the recreate did not take — the instance still holds its old image.")
+		a.say("   wanted: %s", want)
+		a.say("   got:    %s", got)
+		if recreateErr != nil {
+			a.say("   the recreate exited non-zero and left the instance on neither pin.")
+		} else {
+			a.say("   the recreate reported success, but the instance was not rebuilt on the new image.")
+		}
 		a.say("   logs:       incus --project %s console %s --show-log", t.project, instance)
 		rollback()
 		return ErrReported
@@ -337,11 +388,14 @@ func (i identity) got() string {
 	return i.gotID
 }
 
-func (i identity) gotOrID() string {
-	if i.gotID != "" {
-		return i.gotID
+// pair returns wanted and got spelled the same way: as aliases when the
+// instance records one, else as image.id. The alias carries the tag; for an
+// OCI image image.id is often a digest that a tag can never resemble.
+func (i identity) pair() (want, got string) {
+	if i.gotAlias != "" {
+		return i.wantAlias, i.gotAlias
 	}
-	return i.gotAlias
+	return i.wantID, i.gotID
 }
 
 // identity checks whether the instance was created from pin. Two keys record

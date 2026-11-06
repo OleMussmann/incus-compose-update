@@ -327,6 +327,101 @@ func TestApplyRecreateFailureIsLeftToVerification(t *testing.T) {
 	h.wantOutput("recreate exited non-zero — continuing to verify", "==> verified")
 }
 
+func TestApplyRecreateFailureBeforeReplacingRestoresPin(t *testing.T) {
+	// A failed pull aborts the recreate before the instance is touched.
+	h := newHarness(t)
+	h.compose.recreateErr = errors.New("exit 1")
+	h.compose.recreateFn = func(string) {}
+	err := h.app.Apply(context.Background(), "db", newDigest, "")
+	if !errors.Is(err, ErrReported) {
+		t.Fatalf("err = %v\n%s", err, h.out)
+	}
+	if h.pin("DB_DIGEST") != oldDigest {
+		t.Errorf("pin = %s, want it restored to %s", h.pin("DB_DIGEST"), oldDigest)
+	}
+	if len(h.git.commits) != 0 {
+		t.Error("committed a failed apply")
+	}
+	h.wantOutput("db-1 still runs "+oldDigest+" — restoring the pin",
+		"Nothing needs rolling back", "incus-compose-update apply db "+newDigest,
+		"the snapshot pre-sha256-222222222222-202609220949 of vol-db is kept")
+	if strings.Contains(h.out.String(), "roll back:") || strings.Contains(h.out.String(), "not running the new image") {
+		t.Errorf("reported an untouched instance as a failed recreate:\n%s", h.out)
+	}
+
+	// The printed re-run works once the cause is gone.
+	h.compose.recreateErr, h.compose.recreateFn = nil, nil
+	if err := h.app.Apply(context.Background(), "db", newDigest, ""); err != nil {
+		t.Fatalf("re-run: %v\n%s", err, h.out)
+	}
+	if len(h.compose.recreates) != 2 || h.pin("DB_DIGEST") != newDigest {
+		t.Errorf("re-run: recreates %v, pin %s", h.compose.recreates, h.pin("DB_DIGEST"))
+	}
+}
+
+func TestApplyAlreadyOnIsCheckedAgainstTheServer(t *testing.T) {
+	h := newHarness(t)
+	if err := h.app.Apply(context.Background(), "app", "1.0.0", ""); err != nil {
+		t.Fatalf("%v\n%s", err, h.out)
+	}
+	if len(h.compose.recreates) != 0 {
+		t.Error("recreated a service already on its pin")
+	}
+	h.wantOutput("already on 1.0.0")
+}
+
+// pinAhead leaves APP_TAG at 1.1.0 while app-1 still runs 1.0.0, as an apply
+// that pinned and then failed or was cut short does.
+func pinAhead(h *harness, alias string) {
+	pins.Write(filepath.Join(h.alpha, "versions.env"), "APP_TAG", "1.1.0")
+	h.incus.instances["app-1"].Config = map[string]string{"image.id": "acme/app@" + oldDigest}
+	if alias != "" {
+		h.incus.instances["app-1"].Config["user.image_alias"] = alias
+	}
+}
+
+func TestApplyFinishesWhenThePinIsAheadOfTheServer(t *testing.T) {
+	h := newHarness(t)
+	pinAhead(h, "ghcr.io/acme/app:1.0.0")
+	if err := h.app.Apply(context.Background(), "app", "1.1.0", ""); err != nil {
+		t.Fatalf("%v\n%s", err, h.out)
+	}
+	if strings.Join(h.compose.recreates, ",") != "app" {
+		t.Errorf("recreates = %v", h.compose.recreates)
+	}
+	if len(h.git.commits) != 1 || h.git.commits[0] != "app: 1.0.0 -> 1.1.0" {
+		t.Errorf("commits = %v", h.git.commits)
+	}
+	h.wantOutput("versions.env already pins 1.1.0, but app-1 still runs 1.0.0",
+		"==> done. rollback: incus-compose-update apply app 1.0.0")
+}
+
+func TestApplyPinAheadWithoutAliasStops(t *testing.T) {
+	h := newHarness(t)
+	pinAhead(h, "")
+	err := h.app.Apply(context.Background(), "app", "1.1.0", "")
+	if !errors.Is(err, ErrReported) {
+		t.Fatalf("err = %v\n%s", err, h.out)
+	}
+	if len(h.compose.recreates) != 0 {
+		t.Error("recreated without knowing the current pin")
+	}
+	h.wantOutput("records no image alias", "acme/app@"+oldDigest)
+}
+
+func TestApplyAllPicksUpAPinAheadOfTheServer(t *testing.T) {
+	h := newHarness(t)
+	h.reg.digests["library/postgres:18-alpine"] = oldDigest
+	pinAhead(h, "ghcr.io/acme/app:1.0.0")
+	if err := h.app.ApplyAll(context.Background(), true); err != nil {
+		t.Fatalf("%v\n%s", err, h.out)
+	}
+	if strings.Join(h.compose.recreates, ",") != "app" {
+		t.Errorf("recreates = %v", h.compose.recreates)
+	}
+	h.wantOutput("app                    1.0.0 -> 1.1.0", "applied 1 update(s)")
+}
+
 func TestApplyDetectsVanishedAndStoppedInstances(t *testing.T) {
 	for name, fn := range map[string]func(*harness){
 		"vanished": func(h *harness) { delete(h.incus.instances, "app-1") },
@@ -365,7 +460,16 @@ func TestApplyVerificationFailures(t *testing.T) {
 	}{
 		"old image": {
 			func(h *harness) { h.compose.recreateFn = func(string) {} },
-			"is not running the new image",
+			"the recreate reported success, but the instance was not rebuilt",
+		},
+		"failed recreate, neither pin": {
+			func(h *harness) {
+				h.compose.recreateErr = errors.New("exit 1")
+				h.compose.recreateFn = func(string) {
+					h.incus.set("db-1", true, "library/postgres@sha256:3333333333333333333333333333333333333333333333333333333333333333")
+				}
+			},
+			"the recreate exited non-zero and left the instance on neither pin",
 		},
 		"no identity": {
 			func(h *harness) {
@@ -393,6 +497,21 @@ func TestApplyVerificationFailures(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestApplyMismatchComparesAliases(t *testing.T) {
+	// image.id of an OCI image can be a digest even for a tag pin; the alias
+	// is what shows which tag the instance runs.
+	h := newHarness(t)
+	h.incus.instances["app-1"].Config = map[string]string{"user.image_alias": "ghcr.io/acme/app:1.0.0"}
+	h.compose.recreateFn = func(string) {
+		h.incus.instances["app-1"].Config["image.id"] = "acme/app@" + oldDigest
+	}
+	err := h.app.Apply(context.Background(), "app", "1.1.0", "")
+	if !errors.Is(err, ErrReported) {
+		t.Fatalf("err = %v\n%s", err, h.out)
+	}
+	h.wantOutput("wanted: ghcr.io/acme/app:1.1.0\n", "got:    ghcr.io/acme/app:1.0.0\n")
 }
 
 func TestApplyMissingVolume(t *testing.T) {

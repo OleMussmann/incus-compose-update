@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/OleMussmann/incus-compose-update/internal/imageref"
 	"github.com/OleMussmann/incus-compose-update/internal/pins"
 )
 
@@ -59,6 +60,16 @@ func (a *App) ApplyAll(ctx context.Context, assumeYes bool) error {
 			}
 			if next != cur {
 				plan = append(plan, planned{dir, name, cur, next})
+				continue
+			}
+			// Pinned at latest, but an apply that did not finish can leave
+			// the pin ahead of the instance; Apply picks up from there.
+			if id := a.identity(t, name+"-1", cur); id.status == mismatch {
+				from := imageref.PinOf(id.gotAlias)
+				if from == "" {
+					from = id.got()
+				}
+				plan = append(plan, planned{dir, name, from, next})
 			}
 		}
 	}
