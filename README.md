@@ -24,10 +24,11 @@ when present, and go anonymous otherwise.
 ## Commands
 
 ```
-incus-compose-update check                  compare pinned tags against upstream, all services
-incus-compose-update check <service>        same, scoped to one service
-incus-compose-update apply <service> <ref>  snapshot, pin, recreate, re-ensure, verify
-incus-compose-update apply-all [--yes]      apply every pending update, one at a time
+incus-compose-update check                              compare pinned tags against upstream, all services
+incus-compose-update check <service>                    same, scoped to one service
+incus-compose-update apply [--dry-run] <service> <ref>  snapshot, pin, recreate, re-ensure, verify
+incus-compose-update apply-all [--dry-run] [--yes]      apply every pending update, one at a time
+incus-compose-update [<command>] --help                 usage and configuration
 ```
 
 No arguments means `check`. `check` reports a service it cannot check (an

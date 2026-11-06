@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"slices"
 	"strconv"
@@ -23,14 +24,14 @@ import (
 )
 
 const usage = `usage:
-  incus-compose-update check                  compare pinned tags against upstream, all services
-  incus-compose-update check <service>        same, scoped to one service
-  incus-compose-update apply <service> <ref>  snapshot, pin, recreate, verify
-  incus-compose-update apply-all [--yes]      apply every pending update, one at a time
-  incus-compose-update --help                 this text
+  incus-compose-update check                              compare pinned tags against upstream, all services
+  incus-compose-update check <service>                    same, scoped to one service
+  incus-compose-update apply [--dry-run] <service> <ref>  snapshot, pin, recreate, verify
+  incus-compose-update apply-all [--dry-run] [--yes]      apply every pending update, one at a time
+  incus-compose-update [<command>] --help                 this text
 
-  apply and apply-all take --dry-run: run every read-only check and print
-  what would change, touching neither the checkout nor the server.
+  --dry-run runs every read-only check and prints what would change,
+  touching neither the checkout nor the server.
 
 config (environment):
   STACK_DIRS    colon-separated stack directories (required, or STACK_DIR)
@@ -48,13 +49,13 @@ git:
 `
 
 func main() {
-	os.Exit(run(os.Args[1:]))
+	os.Exit(run(os.Args[1:], os.Stdout))
 }
 
-func run(args []string) int {
-	// --help must work without STACK_DIRS set.
-	if len(args) > 0 && (args[0] == "--help" || args[0] == "-h") {
-		fmt.Print(usage)
+func run(args []string, stdout io.Writer) int {
+	// --help must work without STACK_DIRS set, and after a command too.
+	if slices.Contains(args, "--help") || slices.Contains(args, "-h") {
+		fmt.Fprint(stdout, usage)
 		return 0
 	}
 	if len(args) == 0 {
@@ -96,7 +97,7 @@ func run(args []string) int {
 		}
 		err = app.ApplyAll(ctx, flags["--yes"] || flags["-y"])
 	default:
-		return fail(errors.New("usage: incus-compose-update {check [service] | apply <service> <ref> | apply-all [--yes]}"))
+		return fail(errors.New("usage: incus-compose-update {check [service] | apply [--dry-run] <service> <ref> | apply-all [--dry-run] [--yes]}"))
 	}
 	if err != nil {
 		return fail(err)
